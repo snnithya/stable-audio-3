@@ -16,6 +16,8 @@ dependencies = [
     "huggingface-hub>=1.7.1",
     "transformers>=5.8.0",
     "soundfile>=0.13.1",
+    "prefigure==0.0.9",
+    "dill>=0.4.1",
 ]
 
 [project.optional-dependencies]
@@ -68,3 +70,6 @@ exclude = [
     "stable_audio_3/training",
     "optimized",
 ]
+
+[tool.uv]
+cache-dir = "/data/hai-res/snnithya/.uv/"

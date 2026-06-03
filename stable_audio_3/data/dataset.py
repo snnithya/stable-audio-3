@@ -118,7 +118,8 @@ def get_audio_filenames(
 def get_latent_filenames(
     paths,  # directories in which to search
     extension='npy',
-    filelist_path=None
+    filelist_path=None,
+    controls_suffix: Optional[str] = "_controls",
 ):
     "recursively get a list of pre-encoded filenames"
     filenames = []
@@ -140,13 +141,26 @@ def get_latent_filenames(
         _, files = fast_scandir(path, [extension])
         filenames.extend(files)
 
-    # Filter out silence.npy (used for silence latent padding, not a data sample)
+    # Filter out silence.npy and controls sidecar files (not standalone samples)
     filenames = [f for f in filenames if os.path.basename(f) != "silence.npy"]
+    if controls_suffix:
+        filenames = [
+            f for f in filenames
+            if not os.path.basename(f).endswith(f"{controls_suffix}.{extension}")
+        ]
 
-    # Add metadata paths
-    filenames = [(filename, filename.replace(f".{extension}", ".json")) for filename in filenames]
+    # Build (latent_path, json_path, controls_path_or_None) triplets
+    result = []
+    for filename in filenames:
+        json_path = filename.replace(f".{extension}", ".json")
+        controls_path = None
+        if controls_suffix:
+            candidate = filename.replace(f".{extension}", f"{controls_suffix}.{extension}")
+            if os.path.exists(candidate):
+                controls_path = candidate
+        result.append((filename, json_path, controls_path))
 
-    return filenames
+    return result
 
 class LocalDatasetConfig:
     def __init__(
@@ -170,12 +184,14 @@ class LatentDatasetConfig(LocalDatasetConfig):
         self,
         latent_extension: str = "npy",
         filelist_path = None,
+        controls_suffix: Optional[str] = "_controls",
         *args,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.latent_extension = latent_extension
         self.filelist_path = filelist_path
+        self.controls_suffix = controls_suffix
         # weight is inherited from LocalDatasetConfig via **kwargs
 
 class SampleDataset(torch.utils.data.Dataset):
@@ -334,7 +350,12 @@ class PreEncodedDataset(torch.utils.data.Dataset):
         self.silence_latents = {}
 
         for config in configs:
-            new_files = get_latent_filenames(config.path, config.latent_extension, config.filelist_path)
+            new_files = get_latent_filenames(
+                config.path,
+                config.latent_extension,
+                config.filelist_path,
+                controls_suffix=config.controls_suffix,
+            )
             self.filenames.extend(new_files)
             self.sample_weights.extend([config.weight] * len(new_files))
             if config.custom_metadata_fn is not None:
@@ -371,9 +392,13 @@ class PreEncodedDataset(torch.utils.data.Dataset):
         return None
 
     def __getitem__(self, idx):
-        latent_filename, md_filename = self.filenames[idx]
+        latent_filename, md_filename, controls_filename = self.filenames[idx]
         try:
             latents = torch.from_numpy(np.load(latent_filename)) # [C, N]
+
+            controls = None
+            if controls_filename is not None:
+                controls = torch.from_numpy(np.load(controls_filename))  # [C_ctrl, N]
 
             with open(md_filename, "r") as f:
                 try:
@@ -426,6 +451,16 @@ class PreEncodedDataset(torch.utils.data.Dataset):
 
                 info["latent_crop_length"] = self.latent_crop_length
 
+                # Crop/pad controls in sync with the audio latent
+                if controls is not None:
+                    crop_start = info["latent_crop_start"]
+                    ctrl_len = controls.shape[1]
+                    if ctrl_len >= self.latent_crop_length:
+                        controls = controls[:, crop_start:crop_start + self.latent_crop_length]
+                    else:
+                        pad_needed = self.latent_crop_length - ctrl_len
+                        controls = torch.nn.functional.pad(controls, (0, pad_needed))
+
             info["padding_mask"] = [torch.tensor(info["padding_mask"])]
 
             seconds_total = info["seconds_total"]
@@ -450,6 +485,8 @@ class PreEncodedDataset(torch.utils.data.Dataset):
                     latents = info["__replace__"]
 
             info["audio"] = latents
+            if controls is not None:
+                info["controls"] = controls
 
             # Pre-tokenize text fields in DataLoader workers to avoid
             # CPU contention with the main training thread

@@ -1,5 +1,8 @@
+import importlib.util
 import math
 import random
+from pathlib import Path
+
 import torch
 
 from torch import nn
@@ -255,3 +258,138 @@ def compute_effective_seq_len_from_conditioning(
         return None
 
     return torch.tensor(effective_lengths, dtype=torch.float32, device=device)
+
+
+def load_custom_metadata_fn(module_path: str):
+    """Load ``get_custom_metadata(info, audio_or_latents) -> dict`` from a Python file.
+
+    The file must define a top-level callable named ``get_custom_metadata``.
+    """
+    path = Path(module_path).resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"Custom metadata module not found: {path}")
+    spec = importlib.util.spec_from_file_location("_custom_metadata", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    if not hasattr(mod, "get_custom_metadata"):
+        raise AttributeError(
+            f"Module '{path}' must define a function named 'get_custom_metadata'"
+        )
+    return mod.get_custom_metadata
+
+
+def caption_metadata_fn(info, audio):
+    """Default caption loader for raw-audio datasets.
+
+    Reads a sidecar ``.txt`` file with the same stem as the audio file.
+    Returns ``{"__reject__": True}`` when no caption file is found.
+    """
+    txt = Path(info["path"]).with_suffix(".txt")
+    if not txt.exists():
+        return {"__reject__": True}
+    return {"prompt": txt.read_text().strip()}
+
+
+def build_dataset_from_config(
+    cfg: dict,
+    sample_rate: int = 44100,
+    ds_ratio: int = 2048,
+    duration: Optional[float] = None,
+):
+    """Construct a dataset from a parsed JSON config dict.
+
+    Args:
+        cfg:         Parsed dataset config dict.
+        sample_rate: Model sample rate. Used to derive ``latent_crop_length`` /
+                     ``sample_size`` when those are not set in the config.
+        ds_ratio:    Pretransform downsampling ratio.
+        duration:    Clip duration in seconds when crop length is not in config.
+
+    Returns:
+        A ``PreEncodedDataset`` or ``SampleDataset`` instance.
+    """
+    from .dataset import (
+        LatentDatasetConfig,
+        LocalDatasetConfig,
+        PreEncodedDataset,
+        SampleDataset,
+    )
+
+    dataset_type = cfg.get("dataset_type", "pre_encoded")
+    entries = cfg.get("datasets", [])
+    if not entries:
+        raise ValueError("Dataset config must contain at least one entry under 'datasets'")
+
+    if dataset_type == "pre_encoded":
+        configs = []
+        for entry in entries:
+            custom_fn = None
+            if entry.get("custom_metadata_module"):
+                custom_fn = load_custom_metadata_fn(entry["custom_metadata_module"])
+                print(f"  Loaded custom metadata fn from: {entry['custom_metadata_module']}")
+            configs.append(
+                LatentDatasetConfig(
+                    id=entry["id"],
+                    path=entry["path"],
+                    custom_metadata_fn=custom_fn,
+                    weight=entry.get("weight", 1.0),
+                )
+            )
+
+        latent_crop_length = cfg.get("latent_crop_length", None)
+        if latent_crop_length is None:
+            if duration is None:
+                raise ValueError(
+                    "Pre-encoded dataset config must specify 'latent_crop_length', "
+                    "or a duration must be provided to derive it."
+                )
+            sample_size = (int(duration * sample_rate) // ds_ratio) * ds_ratio
+            latent_crop_length = sample_size // ds_ratio
+            print(
+                f"  Derived latent_crop_length={latent_crop_length} "
+                f"(duration={duration}s, sample_rate={sample_rate}, ds_ratio={ds_ratio})"
+            )
+
+        return PreEncodedDataset(
+            configs,
+            latent_crop_length=latent_crop_length,
+            random_crop=cfg.get("random_crop", True),
+        )
+
+    elif dataset_type == "sample":
+        configs = []
+        for entry in entries:
+            custom_fn = None
+            if entry.get("custom_metadata_module"):
+                custom_fn = load_custom_metadata_fn(entry["custom_metadata_module"])
+                print(f"  Loaded custom metadata fn from: {entry['custom_metadata_module']}")
+            configs.append(
+                LocalDatasetConfig(
+                    id=entry["id"],
+                    path=entry["path"],
+                    custom_metadata_fn=custom_fn if custom_fn is not None else caption_metadata_fn,
+                    weight=entry.get("weight", 1.0),
+                )
+            )
+
+        cfg_sr = cfg.get("sample_rate", sample_rate)
+        sample_size = cfg.get("sample_size", None)
+        if sample_size is None:
+            if duration is None:
+                raise ValueError(
+                    "Sample dataset config must specify 'sample_size', "
+                    "or a duration must be provided to derive it."
+                )
+            sample_size = (int(duration * cfg_sr) // ds_ratio) * ds_ratio
+
+        return SampleDataset(
+            configs,
+            sample_size=sample_size,
+            sample_rate=cfg_sr,
+            force_channels=cfg.get("force_channels", "stereo"),
+        )
+
+    else:
+        raise ValueError(
+            f"Unknown dataset_type: '{dataset_type}'. Expected 'pre_encoded' or 'sample'."
+        )
