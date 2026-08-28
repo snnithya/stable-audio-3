@@ -30,6 +30,9 @@ uv sync --extra ui
 
 # Training (LoRA script; full finetune uses same stack)
 uv sync --extra lora
+
+# Flash Attention (pre-built wheel; keeps flash-attn across future syncs)
+uv sync --extra flash
 ```
 
 - **Python entrypoints:** `uv run python …` or `uv run stable-audio …`

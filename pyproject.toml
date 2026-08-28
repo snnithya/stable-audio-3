@@ -18,6 +18,7 @@ dependencies = [
     "soundfile>=0.13.1",
     "prefigure==0.0.9",
     "dill>=0.4.1",
+    "matplotlib"
 ]
 
 [project.optional-dependencies]
@@ -32,6 +33,10 @@ lora = [
   "dill>=0.4.1",
 ]
 
+flash = [
+  "flash-attn>=2.6.3",
+]
+
 [[tool.uv.index]]
 name = "pytorch-cu126"
 url = "https://download.pytorch.org/whl/cu126"
@@ -43,6 +48,9 @@ torch = [
 ]
 torchaudio = [
   { index = "pytorch-cu126", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" }
+]
+flash-attn = [
+  { url = "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.16/flash_attn-2.6.3+cu126torch2.7-cp310-cp310-linux_x86_64.whl", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" }
 ]
 
 [project.scripts]

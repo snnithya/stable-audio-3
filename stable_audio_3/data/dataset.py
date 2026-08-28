@@ -338,6 +338,8 @@ class PreEncodedDataset(torch.utils.data.Dataset):
         latent_crop_length=None,
         min_length_sec=None,
         max_length_sec=None,
+        controls=None,
+        controls_dim=None,
         random_crop=False,
         tokenizers: Optional[dict] = None,
     ):
@@ -371,7 +373,8 @@ class PreEncodedDataset(torch.utils.data.Dataset):
 
         self.latent_crop_length = latent_crop_length
         self.random_crop = random_crop
-
+        self.controls = controls
+        self.controls_dim = controls_dim
         self.min_length_sec = min_length_sec
         self.max_length_sec = max_length_sec
 
@@ -486,7 +489,12 @@ class PreEncodedDataset(torch.utils.data.Dataset):
 
             info["audio"] = latents
             if controls is not None:
-                info["controls"] = controls
+                ind = 0
+                controls_dict = {}
+                for control, dim in zip(self.controls, self.controls_dim):
+                    controls_dict[control] = controls[ind:ind+dim]
+                    ind += dim
+                info["controls"] = controls_dict
 
             # Pre-tokenize text fields in DataLoader workers to avoid
             # CPU contention with the main training thread

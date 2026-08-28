@@ -44,7 +44,6 @@ import os
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
 import argparse
-import json
 from pathlib import Path
 
 import torch
@@ -103,17 +102,12 @@ def main():
 
     config_path = Path(args.config).resolve()
     if not config_path.exists():
-        p.error(f"Config file not found: {config_path}")
-
-    with open(config_path) as f:
-        cfg = json.load(f)
+        p.error(f"Config path not found: {config_path}")
 
     print(f"Config: {config_path}")
-    print(f"  dataset_type : {cfg.get('dataset_type', 'pre_encoded')}")
-    print(f"  datasets     : {[d['id'] for d in cfg.get('datasets', [])]}")
 
     dataset = build_dataset_from_config(
-        cfg,
+        config_path,
         sample_rate=args.sample_rate,
         ds_ratio=args.ds_ratio,
         duration=args.duration,

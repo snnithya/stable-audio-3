@@ -65,6 +65,9 @@ uv sync --extra lora
 
 # Everything
 uv sync --extra ui --extra lora
+
+# With Flash attention
+uv sync --extra flash
 ```
 
 ### CUDA Version

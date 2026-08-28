@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import math
 import random
 from pathlib import Path
@@ -6,7 +7,7 @@ from pathlib import Path
 import torch
 
 from torch import nn
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 from torchaudio import transforms as T
 
@@ -290,18 +291,122 @@ def caption_metadata_fn(info, audio):
     return {"prompt": txt.read_text().strip()}
 
 
-def build_dataset_from_config(
-    cfg: dict,
+def build_pre_encoded_dataset(
+    path: Union[str, Path],
+    *,
+    latent_crop_length: Optional[int] = None,
+    random_crop: bool = True,
+    custom_metadata_module: Optional[str] = None,
     sample_rate: int = 44100,
     ds_ratio: int = 2048,
     duration: Optional[float] = None,
 ):
-    """Construct a dataset from a parsed JSON config dict.
+    """Build a ``PreEncodedDataset`` from a latents directory.
 
     Args:
-        cfg:         Parsed dataset config dict.
-        sample_rate: Model sample rate. Used to derive ``latent_crop_length`` /
-                     ``sample_size`` when those are not set in the config.
+        path:                   Directory of pre-encoded latent ``.npy`` files.
+        latent_crop_length:     Crop length in latent frames. Derived from
+                                ``duration`` / ``sample_rate`` / ``ds_ratio`` if omitted.
+        random_crop:            Whether to randomly crop within the valid region.
+        custom_metadata_module: Optional path to a Python file defining
+                                ``get_custom_metadata(info, latents) -> dict``.
+        sample_rate:            Used to derive ``latent_crop_length`` when not set.
+        ds_ratio:               Pretransform downsampling ratio.
+        duration:               Clip duration in seconds, used to derive crop length.
+
+    Returns:
+        A ``PreEncodedDataset`` instance.
+    """
+    from .dataset import LatentDatasetConfig, PreEncodedDataset
+
+    path = Path(path)
+    custom_fn = None
+    if custom_metadata_module:
+        custom_fn = load_custom_metadata_fn(custom_metadata_module)
+        print(f"  Loaded custom metadata fn from: {custom_metadata_module}")
+
+    config = LatentDatasetConfig(id=path.name, path=str(path), custom_metadata_fn=custom_fn)
+
+    if latent_crop_length is None:
+        if duration is None:
+            raise ValueError(
+                "latent_crop_length or duration must be provided."
+            )
+        sample_size = (int(duration * sample_rate) // ds_ratio) * ds_ratio
+        latent_crop_length = sample_size // ds_ratio
+        print(
+            f"  Derived latent_crop_length={latent_crop_length} "
+            f"(duration={duration}s, sample_rate={sample_rate}, ds_ratio={ds_ratio})"
+        )
+
+    return PreEncodedDataset([config], latent_crop_length=latent_crop_length, random_crop=random_crop)
+
+
+def build_sample_dataset(
+    path: Union[str, Path],
+    *,
+    sample_size: Optional[int] = None,
+    sample_rate: int = 44100,
+    ds_ratio: int = 2048,
+    duration: Optional[float] = None,
+    custom_metadata_module: Optional[str] = None,
+    force_channels: str = "stereo",
+):
+    """Build a ``SampleDataset`` from a directory of audio files.
+
+    Args:
+        path:                   Directory of audio files with sidecar ``.txt`` captions.
+        sample_size:            Number of audio samples per clip. Derived from
+                                ``duration`` / ``sample_rate`` if omitted.
+        sample_rate:            Audio sample rate.
+        ds_ratio:               Pretransform downsampling ratio (used only when
+                                deriving ``sample_size`` from ``duration``).
+        duration:               Clip duration in seconds, used to derive sample size.
+        custom_metadata_module: Optional path to a Python file defining
+                                ``get_custom_metadata(info, audio) -> dict``.
+        force_channels:         ``"stereo"`` or ``"mono"``.
+
+    Returns:
+        A ``SampleDataset`` instance.
+    """
+    from .dataset import LocalDatasetConfig, SampleDataset
+
+    path = Path(path)
+    custom_fn = None
+    if custom_metadata_module:
+        custom_fn = load_custom_metadata_fn(custom_metadata_module)
+        print(f"  Loaded custom metadata fn from: {custom_metadata_module}")
+
+    config = LocalDatasetConfig(
+        id=path.name,
+        path=str(path),
+        custom_metadata_fn=custom_fn if custom_fn is not None else caption_metadata_fn,
+    )
+
+    if sample_size is None:
+        if duration is None:
+            raise ValueError("sample_size or duration must be provided.")
+        sample_size = (int(duration * sample_rate) // ds_ratio) * ds_ratio
+
+    return SampleDataset([config], sample_size=sample_size, sample_rate=sample_rate, force_channels=force_channels)
+
+
+def build_dataset_from_config(
+    path: Union[str, Path],
+    sample_rate: int = 44100,
+    ds_ratio: int = 2048,
+    duration: Optional[float] = None,
+) -> torch.utils.data.Dataset:
+    """Construct a dataset from a JSON config file or a latents directory.
+
+    For multi-dataset configs or advanced options (weights, custom metadata,
+    force_channels, etc.) use ``build_pre_encoded_dataset`` /
+    ``build_sample_dataset`` directly.
+
+    Args:
+        path:        Path to a JSON config file **or** a directory of pre-encoded
+                     latents (treated as a single-entry pre_encoded dataset).
+        sample_rate: Model sample rate.
         ds_ratio:    Pretransform downsampling ratio.
         duration:    Clip duration in seconds when crop length is not in config.
 
@@ -315,8 +420,23 @@ def build_dataset_from_config(
         SampleDataset,
     )
 
-    dataset_type = cfg.get("dataset_type", "pre_encoded")
-    entries = cfg.get("datasets", [])
+    json_path = Path(path)
+    if json_path.is_dir():
+        return build_pre_encoded_dataset(
+            json_path,
+            sample_rate=sample_rate,
+            ds_ratio=ds_ratio,
+            duration=duration,
+        )
+
+    if not json_path.is_file():
+        raise FileNotFoundError(f"Dataset config not found: {json_path}")
+
+    with open(json_path) as f:
+        config = json.load(f)
+
+    dataset_type = config.get("dataset_type", "pre_encoded")
+    entries = config.get("datasets", [])
     if not entries:
         raise ValueError("Dataset config must contain at least one entry under 'datasets'")
 
@@ -336,7 +456,7 @@ def build_dataset_from_config(
                 )
             )
 
-        latent_crop_length = cfg.get("latent_crop_length", None)
+        latent_crop_length = config.get("latent_crop_length", None)
         if latent_crop_length is None:
             if duration is None:
                 raise ValueError(
@@ -353,7 +473,9 @@ def build_dataset_from_config(
         return PreEncodedDataset(
             configs,
             latent_crop_length=latent_crop_length,
-            random_crop=cfg.get("random_crop", True),
+            random_crop=config.get("random_crop", True),
+            controls=config.get("controls", None),
+            controls_dim=config.get("controls_dim", None),
         )
 
     elif dataset_type == "sample":
@@ -372,21 +494,21 @@ def build_dataset_from_config(
                 )
             )
 
-        cfg_sr = cfg.get("sample_rate", sample_rate)
-        sample_size = cfg.get("sample_size", None)
+        sr = config.get("sample_rate", sample_rate)
+        sample_size = config.get("sample_size", None)
         if sample_size is None:
             if duration is None:
                 raise ValueError(
                     "Sample dataset config must specify 'sample_size', "
                     "or a duration must be provided to derive it."
                 )
-            sample_size = (int(duration * cfg_sr) // ds_ratio) * ds_ratio
+            sample_size = (int(duration * sr) // ds_ratio) * ds_ratio
 
         return SampleDataset(
             configs,
             sample_size=sample_size,
-            sample_rate=cfg_sr,
-            force_channels=cfg.get("force_channels", "stereo"),
+            sample_rate=sr,
+            force_channels=config.get("force_channels", "stereo"),
         )
 
     else:

@@ -1,0 +1,60 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+
+        {
+            "name": "Debug debug_dataset.py",
+            "type": "python",
+            "request": "launch",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "program": "${workspaceFolder}/scripts/debug_dataset.py",
+            "args": [
+                "--config",
+                "${workspaceFolder}/stable_audio_3/configs/dataset_configs/preencoded/local_babyslakh_preencoded.json"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "Finetune small-music",
+            "type": "python",
+            "request": "launch",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "program": "${workspaceFolder}/scripts/train_finetune.py",
+            "args": [
+                "--model",
+                "small-music",
+                "--dataset_config",
+                "${workspaceFolder}/stable_audio_3/configs/dataset_configs/preencoded/local_babyslakh_preencoded.json",
+                "--save_dir",
+                "/data/scratch-fast/snnithya/sao-3/ft_checkpoints/debug",
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "2"
+            }
+        },
+        {
+            "name": "Pre-encode dataset",
+            "type": "python",
+            "request": "launch",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "program": "${workspaceFolder}/scripts/pre_encode_dataset.py",
+            "args": [
+                "--dataset_config",
+                "${workspaceFolder}/stable_audio_3/configs/dataset_configs/dataset2preencoding/local_babyslakh.json",
+                "--model",
+                "same-s",
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "2"
+            }
+        }
+    ]
+}

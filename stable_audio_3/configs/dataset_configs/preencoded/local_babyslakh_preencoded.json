@@ -1,0 +1,15 @@
+{
+    "dataset_type": "pre_encoded",
+    "datasets": [
+        {
+            "id": "babyslakh-local",
+            "path": "/data/scratch-fast/snnithya/sao-3/data/babyslakh-preencoded/",
+            "custom_metadata_module": "stable_audio_3/configs/dataset_configs/custom_metadata/custom_md_slakh.py"
+        }
+    ],
+    "latent_crop_length": 256,
+    "random_crop": false,
+    "controls": [],
+    "controls_dim": [],
+    "_comment": "Local config for pre-encoded BabySlakh latents (for collaborators)."
+}
