@@ -1,0 +1,15 @@
+{
+    "dataset_type": "pre_encoded",
+    "datasets": [
+        {
+            "id": "slakh-streamgen-validation",
+            "path": "/data/scratch-fast/snnithya/sao-3/data/slakh-streamgen-preencoded/validation/",
+            "custom_metadata_module": "stable_audio_3/configs/dataset_configs/custom_metadata/custom_md_slakh.py"
+        }
+    ],
+    "latent_crop_length": 1024,
+    "random_crop": false,
+    "controls": ["streamgen_latent"],
+    "controls_dim": [256],
+    "_comment": "Slakh2100 validation split (270 tracks), held out from training. random_crop is off and the window is long (1024 frames ~= 95s) on purpose: scripts/eval_streamgen.py takes a deterministic centred sub-window from it, so every arm is scored on byte-identical frames. Do not train on this config."
+}

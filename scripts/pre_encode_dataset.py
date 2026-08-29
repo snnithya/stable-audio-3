@@ -18,6 +18,10 @@ Usage (CLI args):
 Usage (dataset config):
   uv run python scripts/pre_encode_dataset.py --dataset_config stable_audio_3/configs/dataset_configs/dataset2preencoding/local_babyslakh.json
 
+Sanity check — decode the first few encoded items back to audio (source/decoded pairs,
+plus every control stream) into <output_path>/_sanity_check/ so you can listen to them:
+  uv run python scripts/pre_encode_dataset.py --dataset_config ... --sanity_check_samples 3
+
 Config format (mirrors existing dataset JSON configs):
   {
     "dataset_type": "audio_dir",
@@ -30,6 +34,7 @@ Config format (mirrors existing dataset JSON configs):
       }
     ],
     "model": "same-l",           ← optional overrides for any CLI arg
+    "sanity_check_samples": 3,   ← decode this many items back to audio for a listening check
     "batch_size": 1,
     "sample_size": 12582912,
     "model_half": false,
@@ -50,6 +55,7 @@ from types import ModuleType
 
 import numpy as np
 import torch
+import torchaudio
 from torch.nn import functional as F
 
 from stable_audio_3 import AutoencoderModel
@@ -77,12 +83,41 @@ def load_custom_metadata_module(module_path: str) -> ModuleType:
     return mod
 
 
+def write_sanity_wavs(ae, out_dir, latent_id, source_audio, latent, control_audio, control_latents):
+    """Round-trip one encoded item back to audio so it can be listened to.
+
+    Writes the exact tensor that went into the encoder next to the decode of the
+    latent that came out, plus the same pair for every control stream. This is
+    the listening counterpart to scripts/check_streamgen_alignment.py.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    sr = ae.sample_rate
+
+    def save(suffix, audio, length=None):
+        audio = audio.detach().float().cpu()
+        if length is not None:
+            audio = audio[:, :length]
+        torchaudio.save(os.path.join(out_dir, f"{latent_id}_{suffix}.wav"), audio.clamp(-1, 1), sr)
+
+    with torch.no_grad():
+        decoded = ae.decode(latent.unsqueeze(0)).squeeze(0)
+    save("decoded", decoded)
+    # Source is padded to sample_size; trim it to what the (possibly truncated) latent covers.
+    save("source", source_audio, length=decoded.shape[-1])
+
+    for key, ctrl_latent in control_latents.items():
+        with torch.no_grad():
+            ctrl_decoded = ae.decode(ctrl_latent.unsqueeze(0)).squeeze(0)
+        save(f"control_{key}_decoded", ctrl_decoded)
+        save(f"control_{key}_source", control_audio[key], length=ctrl_decoded.shape[-1])
+
+
 def encode_dataset(ae, data_dir, output_path, custom_metadata_fn, args):
     """Encode all audio in data_dir and write latents to output_path."""
     dataset = SampleDataset(
         [
             LocalDatasetConfig(
-                id="train",
+                id="train", # dead id, shouldn't make a difference downstream
                 path=data_dir,
                 custom_metadata_fn=custom_metadata_fn,
             )
@@ -90,6 +125,10 @@ def encode_dataset(ae, data_dir, output_path, custom_metadata_fn, args):
         sample_size=args.sample_size,
         sample_rate=ae.sample_rate,
         force_channels="stereo",
+        # PadCrop_Normalized_T draws a fresh offset on every call, and extra `__audio__`
+        # tensors (e.g. the streamgen accompaniment) are cropped in a separate call from
+        # the main audio. A deterministic offset is what keeps them time-aligned.
+        random_crop=False,
     )
     loader = torch.utils.data.DataLoader(
         dataset,
@@ -102,6 +141,9 @@ def encode_dataset(ae, data_dir, output_path, custom_metadata_fn, args):
 
     os.makedirs(output_path, exist_ok=True)
     device = next(ae.autoencoder.parameters()).device
+
+    sanity_dir = args.sanity_check_dir or os.path.join(output_path, "_sanity_check")
+    sanity_remaining = args.sanity_check_samples or 0
 
     silence_path = os.path.join(output_path, "silence.npy")
     if not os.path.exists(silence_path):
@@ -128,11 +170,37 @@ def encode_dataset(ae, data_dir, output_path, custom_metadata_fn, args):
 
         latents = ae.encode(audio, ae.sample_rate)
 
+        # Control signals are encoded with the same autoencoder, so they land on the same
+        # frame grid as the latents and can be cropped in lockstep at training time.
+        control_latents = None
+        if args.controls:
+            control_parts = []
+            for key in args.controls:
+                missing = [i for i, md in enumerate(metadata) if key not in md]
+                if missing:
+                    raise KeyError(
+                        f"Control '{key}' missing from metadata for {len(missing)} item(s) in batch {nb}. "
+                        f"The custom_metadata_module must return it under '__audio__'."
+                    )
+                control_audio = torch.stack([md[key] for md in metadata], dim=0).to(device)
+                if args.model_half:
+                    control_audio = control_audio.half()
+                control_parts.append(ae.encode(control_audio, ae.sample_rate))
+            control_dims = [p.shape[1] for p in control_parts]
+            # Fused along the channel axis; the dataset config's controls/controls_dim
+            # split it back out in this same order.
+            control_latents = torch.cat(control_parts, dim=1)
+
         for i, latent in enumerate(latents):
             latent_np = latent.cpu().numpy()
             latent_id = f"{nb:06d}{i:04d}"
 
             md = dict(metadata[i])
+
+            # Control audio is multi-minute raw waveform; it has already been encoded into
+            # the sidecar and must not reach the JSON metadata dump below.
+            for key in args.controls or []:
+                md.pop(key, None)
             padding_mask = (
                 F.interpolate(
                     md["padding_mask"][0].unsqueeze(0).unsqueeze(1).float(),
@@ -153,6 +221,13 @@ def encode_dataset(ae, data_dir, output_path, custom_metadata_fn, args):
 
             np.save(os.path.join(output_path, f"{latent_id}.npy"), latent_np)
 
+            if control_latents is not None:
+                control_np = control_latents[i].cpu().numpy()[:, : latent_np.shape[-1]]
+                np.save(os.path.join(output_path, f"{latent_id}_controls.npy"), control_np)
+                md["controls_dim"] = [
+                    control_latents.shape[1] // len(args.controls)
+                ] * len(args.controls)
+
             md["padding_mask"] = padding_mask.cpu().numpy().tolist()
             for k, v in md.items():
                 if isinstance(v, torch.Tensor):
@@ -160,6 +235,27 @@ def encode_dataset(ae, data_dir, output_path, custom_metadata_fn, args):
 
             with open(os.path.join(output_path, f"{latent_id}.json"), "w") as f:
                 json.dump(md, f)
+
+            if sanity_remaining > 0:
+                sanity_controls = {}
+                if control_latents is not None:
+                    ind = 0
+                    for key, dim in zip(args.controls, control_dims):
+                        sanity_controls[key] = control_latents[i][ind : ind + dim, : latent_np.shape[-1]]
+                        ind += dim
+                write_sanity_wavs(
+                    ae,
+                    sanity_dir,
+                    latent_id,
+                    audio[i],
+                    torch.from_numpy(latent_np).to(device),
+                    {key: metadata[i][key] for key in sanity_controls},
+                    sanity_controls,
+                )
+                sanity_remaining -= 1
+                if sanity_remaining == 0:
+                    print(f"Wrote sanity-check wavs to {sanity_dir}")
+                    print(f"  Listen to them: uv run python scripts/make_listening_page.py --dir {sanity_dir}")
 
 
 def load_config(config_path: str) -> dict:
@@ -175,7 +271,17 @@ def merge_config_into_args(args, cfg: dict, parser: argparse.ArgumentParser):
     """
     cli_supplied = {a for a in vars(args) if getattr(args, a) is not None and getattr(args, a) is not False}
 
-    scalar_keys = ("model", "batch_size", "sample_size", "model_half", "pad", "output_path")
+    scalar_keys = (
+        "model",
+        "batch_size",
+        "sample_size",
+        "model_half",
+        "pad",
+        "output_path",
+        "controls",
+        "sanity_check_samples",
+        "sanity_check_dir",
+    )
     for key in scalar_keys:
         if key in cfg and key not in cli_supplied:
             setattr(args, key, cfg[key])
@@ -256,6 +362,31 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--pad", action="store_true", help="Pad audio samples to --sample_size"
+    )
+    parser.add_argument(
+        "--controls",
+        nargs="*",
+        default=None,
+        help=(
+            "Metadata keys holding extra audio (returned by the custom_metadata_module under "
+            "'__audio__') to encode into a fused {id}_controls.npy sidecar, e.g. streamgen_audio. "
+            "The order given here is the channel order in the sidecar and must match "
+            "'controls'/'controls_dim' in the training dataset config."
+        ),
+    )
+    parser.add_argument(
+        "--sanity_check_samples",
+        type=int,
+        default=None,
+        help=(
+            "Decode this many encoded items back to audio and write them alongside the "
+            "source audio that was encoded, for a listening check. 0 disables."
+        ),
+    )
+    parser.add_argument(
+        "--sanity_check_dir",
+        default=None,
+        help="Where to write sanity-check wavs (default: <output_path>/_sanity_check)",
     )
     args = parser.parse_args()
 

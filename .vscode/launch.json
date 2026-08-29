@@ -46,14 +46,19 @@
             "program": "${workspaceFolder}/scripts/pre_encode_dataset.py",
             "args": [
                 "--dataset_config",
-                "${workspaceFolder}/stable_audio_3/configs/dataset_configs/dataset2preencoding/local_babyslakh.json",
+                "${workspaceFolder}/stable_audio_3/configs/dataset_configs/dataset2preencoding/local_babyslakh_streamgen.json",
                 "--model",
                 "same-s",
+                "--sample_size",
+                "529200",
+                "--batch_size",
+                "1",
+                "--pad"
             ],
             "console": "integratedTerminal",
             "justMyCode": true,
             "env": {
-                "CUDA_VISIBLE_DEVICES": "2"
+                "CUDA_VISIBLE_DEVICES": "0"
             }
         }
     ]

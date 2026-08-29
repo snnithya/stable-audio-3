@@ -1,0 +1,15 @@
+{
+    "dataset_type": "pre_encoded",
+    "datasets": [
+        {
+            "id": "slakh-streamgen-train",
+            "path": "/data/scratch-fast/snnithya/sao-3/data/slakh-streamgen-preencoded/train/",
+            "custom_metadata_module": "stable_audio_3/configs/dataset_configs/custom_metadata/custom_md_slakh.py"
+        }
+    ],
+    "latent_crop_length": 256,
+    "random_crop": true,
+    "controls": ["streamgen_latent"],
+    "controls_dim": [256],
+    "_comment": "Slakh2100 train split (1289 tracks, ~89h of drums), pre-encoded with the streamgen accompaniment control. 256 latent frames ~= 23.8s per item, randomly cropped each epoch. 'controls'/'controls_dim' split the fused {id}_controls.npy sidecar and MUST match the channel order used at pre-encode time."
+}

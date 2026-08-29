@@ -1,7 +1,10 @@
 import random
 import torch
 from enum import Enum
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
+
+# Lookahead horizon in latent frames: a fixed int, or a (lo, hi) range sampled per item.
+tp_FutureVisibility = Union[int, Tuple[int, int], List[int]]
 
 class MaskType(Enum):
     RANDOM_SEGMENTS = 0  # Legacy: uncontrolled ratio, overlapping segments
@@ -119,7 +122,8 @@ def random_inpaint_mask(
     max_spans: int = 4,
     mask_ratio_range: Tuple[float, float] = (0.2, 1.0),
     span_count_weights: Optional[List[float]] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    future_visibility: Optional[tp_FutureVisibility] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Generates random inpainting masks for a batch of latent audio sequences.
     The output inpainting mask has 0 where data should be inpainted, and 1 where data is provided.
@@ -145,12 +149,20 @@ def random_inpaint_mask(
         max_spans: (RANDOM_SPANS only) Maximum number of masked spans.
         mask_ratio_range: (RANDOM_SPANS only) (lo, hi) for uniform sampling of target mask ratio.
         span_count_weights: (RANDOM_SPANS only) Weights for sampling number of spans [1..max_spans].
+        future_visibility: (CAUSAL_MASK only) Lookahead horizon in latent frames, controlling how far
+                           past the generation cursor a streaming condition may see. An int fixes the
+                           horizon; a (lo, hi) tuple samples it per item. Negative values place the
+                           horizon *before* the cursor. If None, tf_inpaint_mask is identical to
+                           inpaint_mask, i.e. the returned third value carries no extra information.
 
     Returns:
         A tuple containing:
             - masked_sequence: The sequence with masks applied (original sequence where mask is 1,
                                and usually 0 or a placeholder where mask is 0).
             - inpaint_mask: The generated inpainting mask tensor (0 for inpaint, 1 for keep).
+            - tf_inpaint_mask: Same polarity as inpaint_mask, but 1 only up to the lookahead horizon
+                               (unmasked_prefix_len + future_visibility). Used to gate conditioning
+                               that must not reveal the future, e.g. streamgen's accompaniment latent.
     """
     b, _, sequence_length = sequence.size()
 
@@ -182,12 +194,14 @@ def random_inpaint_mask(
             )
 
     output_masks_list = []
+    tf_masks_list = []
 
     for i in range(b):
         padding_mask_single_item = padding_masks[i]
         real_sequence_length = (padding_mask_single_item == 1).sum().item()
 
         item_mask = torch.ones((1, 1, sequence_length), device=sequence.device, dtype=torch.float32)
+        tf_item_mask = None
 
         if force_mask_type is not None:
             current_mask_type = force_mask_type
@@ -229,14 +243,35 @@ def random_inpaint_mask(
                 if unmasked_prefix_len < real_sequence_length:
                     item_mask[:, :, unmasked_prefix_len:real_sequence_length] = 0
 
+                # Lookahead horizon, measured from the generation cursor. Clamped into
+                # [0, real_sequence_length] so a negative or oversized offset stays in range.
+                if future_visibility is not None:
+                    if isinstance(future_visibility, int):
+                        horizon = unmasked_prefix_len + future_visibility
+                    else:
+                        lo, hi = future_visibility
+                        lo = max(0, min(real_sequence_length, unmasked_prefix_len + lo))
+                        hi = max(0, min(real_sequence_length, unmasked_prefix_len + hi))
+                        horizon = lo if lo >= hi else random.randint(lo, hi - 1)
+                    horizon = max(0, min(real_sequence_length, horizon))
+
+                    tf_item_mask = torch.ones_like(item_mask)
+                    tf_item_mask[:, :, horizon:] = 0
+
             # When using attention masking for variable-length training, zero out padding
             # so the model doesn't see it as provided context. Without attention masking,
             # padding is handled via mask_loss_weight and should remain as provided input.
             if mask_padding:
                 item_mask[:, :, real_sequence_length:] = 0
+                if tf_item_mask is not None:
+                    tf_item_mask[:, :, real_sequence_length:] = 0
 
         output_masks_list.append(item_mask)
+        # Without a lookahead horizon the two masks coincide, which keeps every existing
+        # caller's behavior unchanged.
+        tf_masks_list.append(item_mask.clone() if tf_item_mask is None else tf_item_mask)
 
     final_inpaint_mask = torch.cat(output_masks_list, dim=0).to(sequence.device)
+    final_tf_inpaint_mask = torch.cat(tf_masks_list, dim=0).to(sequence.device)
     masked_sequence = sequence * final_inpaint_mask
-    return masked_sequence, final_inpaint_mask
+    return masked_sequence, final_inpaint_mask, final_tf_inpaint_mask

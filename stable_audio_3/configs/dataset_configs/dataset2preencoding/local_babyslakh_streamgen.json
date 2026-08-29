@@ -1,0 +1,14 @@
+{
+    "dataset_type": "audio_dir",
+    "output_path": "/data/hai-res/shared/snnithya/sao-3/data/babyslakh-streamgen-preencoded-same-s/",
+    "datasets": [
+        {
+            "id": "babyslakh-streamgen",
+            "path": "/data/hai-res/shared/snnithya/sat-zenon-data/babyslakh/streamgen-drum-mirror/tracks/drums/",
+            "custom_metadata_module": "stable_audio_3/configs/dataset_configs/custom_metadata/custom_md_slakh_streamgen.py"
+        }
+    ],
+    "model": "same-s",
+    "controls": ["streamgen_audio"],
+    "_comment": "Pre-encoding config for BabySlakh with the streamgen accompaniment control. 'controls' here names METADATA AUDIO KEYS returned by the custom_metadata_module under __audio__; each is VAE-encoded and fused, in this order, into {id}_controls.npy. The training-side config (preencoded/local_babyslakh_streamgen_preencoded.json) names the resulting LATENT controls and must list them in the same order."
+}

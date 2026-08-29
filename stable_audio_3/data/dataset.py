@@ -282,7 +282,7 @@ class SampleDataset(torch.utils.data.Dataset):
 
             audio = audio.clamp(-1, 1)
 
-            # Encode the file to assist in prediction
+            # Encode the file to assist in prediction, ensure shape / # channels 
             if self.encoding is not None:
                 audio = self.encoding(audio)
 
@@ -294,7 +294,7 @@ class SampleDataset(torch.utils.data.Dataset):
                 if root_path in audio_filename:
                     info["relpath"] = path.relpath(audio_filename, root_path)
 
-            info["timestamps"] = (t_start, t_end)
+            info["timestamps"] = (t_start, t_end) # fractional value ranging from (0, 1)
             info["seconds_start"] = seconds_start
             info["seconds_total"] = seconds_total
             info["padding_mask"] = [padding_mask]

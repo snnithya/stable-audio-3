@@ -1,0 +1,15 @@
+{
+    "dataset_type": "audio_dir",
+    "output_path": "/data/scratch-fast/snnithya/sao-3/data/slakh-streamgen-preencoded/train/",
+    "datasets": [
+        {
+            "id": "slakh-streamgen-train",
+            "path": "/data/scratch-fast/snnithya/sat-zenon/data/slakh2100/streamgen-drum-mirror/train/tracks/drums/",
+            "custom_metadata_module": "stable_audio_3/configs/dataset_configs/custom_metadata/custom_md_slakh_streamgen.py"
+        }
+    ],
+    "controls": [
+        "streamgen_audio"
+    ],
+    "_comment": "Slakh2100 train split, pre-encoded with the streamgen accompaniment control. Same mechanism as local_babyslakh_streamgen.json, on the full corpus with the official Slakh splits, which is what 1.2 needs to say anything about generalization. Pass --sample_size 16760832 on the CLI (4092 latent frames, 380s, covering the 95th percentile track length): pre_encode_dataset.py's merge_config_into_args treats any argparse default that is not None as CLI-supplied, so a 'sample_size' key here would be silently ignored. Run with --batch_size 1 and no --pad so each track keeps its natural length."
+}

@@ -199,6 +199,19 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
         if self.inpainting_config is not None:
             self.inpaint_mask_kwargs = self.inpainting_config.get("mask_kwargs", {})
 
+            # future_visibility is authored in seconds (it describes a musical lookahead),
+            # but the mask lives in latent frames, so convert once here.
+            future_visibility = self.inpainting_config.get("future_visibility", None)
+            if future_visibility is not None:
+                ds_ratio = self.diffusion.pretransform.downsampling_ratio if self.diffusion.pretransform is not None else 1
+                frames_per_second = sample_rate / ds_ratio
+                if isinstance(future_visibility, (list, tuple)):
+                    future_visibility = tuple(int(v * frames_per_second) for v in future_visibility)
+                else:
+                    future_visibility = int(future_visibility * frames_per_second)
+                self.inpaint_mask_kwargs["future_visibility"] = future_visibility
+                print(f"Inpainting future_visibility: {self.inpainting_config['future_visibility']}s -> {future_visibility} latent frames")
+
         # Per-element schedule shift based on effective (unpadded) sequence length
         # Backward compat: if passed from training config, propagate to model
         if use_effective_length_for_schedule and not self.diffusion.use_effective_length_for_schedule:
@@ -243,6 +256,40 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
             return [opt_diff], [sched_diff_config]
 
         return [opt_diff]
+
+    def _add_streamgen_conditioning(self, conditioning, metadata, tf_inpaint_mask):
+        """Attach the accompaniment ("streamgen") latent to the conditioning dict.
+
+        The latent is a pre-encoded control produced alongside the audio latents and split
+        out by PreEncodedDataset into info["controls"]. It is injected here rather than via
+        a Conditioner because the gating mask is only generated at this point.
+
+        Note the polarity: the inpainting conds are multiplied by (1 - mask), but the
+        accompaniment is multiplied by tf_inpaint_mask itself, so it is visible in the
+        context region and up to the lookahead horizon, and hidden beyond it. That gating is
+        the whole point - without it the model would see the future accompaniment and the
+        condition would stop being causal.
+        """
+        if "streamgen_latent" not in self.diffusion.modular_local_cond_ids:
+            return
+
+        missing = [i for i, m in enumerate(metadata) if "streamgen_latent" not in m.get("controls", {})]
+        if missing:
+            raise ValueError(
+                f"streamgen_latent is configured as a modular local cond but is missing from "
+                f"info['controls'] for {len(missing)}/{len(metadata)} items in the batch. "
+                f"Check that the dataset config lists it under 'controls'/'controls_dim' and that "
+                f"the *_controls.npy sidecars exist."
+            )
+
+        streamgen = torch.stack(
+            [m["controls"]["streamgen_latent"] for m in metadata], dim=0
+        ).to(self.device)
+
+        if tf_inpaint_mask is not None:
+            streamgen = streamgen * tf_inpaint_mask
+
+        conditioning["streamgen_latent"] = [streamgen]
 
     def training_step(self, batch, batch_idx):
         reals, metadata = batch
@@ -408,10 +455,13 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
             max_mask_length = diffusion_input.shape[2]
 
             # Create a mask of random length for a random slice of the input
-            inpaint_masked_input, inpaint_mask = random_inpaint_mask(diffusion_input, padding_masks=augmented_padding_mask, mask_padding=self.mask_padding_attention, **self.inpaint_mask_kwargs)
+            inpaint_masked_input, inpaint_mask, tf_inpaint_mask = random_inpaint_mask(diffusion_input, padding_masks=augmented_padding_mask, mask_padding=self.mask_padding_attention, **self.inpaint_mask_kwargs)
 
             conditioning['inpaint_mask'] = [inpaint_mask]
             conditioning['inpaint_masked_input'] = [inpaint_masked_input]
+            conditioning['tf_inpaint_mask'] = [tf_inpaint_mask]
+
+            self._add_streamgen_conditioning(conditioning, metadata, tf_inpaint_mask)
 
             # Only compute loss on inpainted region (where model is generating)
             loss_mask = loss_mask & ~inpaint_mask.squeeze(1).to(torch.bool)
@@ -553,6 +603,9 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
             inpaint_masked_input = torch.zeros_like(diffusion_input)
             conditioning['inpaint_mask'] = [inpaint_mask]
             conditioning['inpaint_masked_input'] = [inpaint_masked_input]
+            # FULL_MASK validation: nothing is given, so the accompaniment is fully hidden too.
+            conditioning['tf_inpaint_mask'] = [inpaint_mask]
+            self._add_streamgen_conditioning(conditioning, metadata, inpaint_mask)
 
         for validation_timestep in self.validation_timesteps:
 
@@ -801,7 +854,7 @@ class DiffusionCondInpaintDemoCallback(pl.Callback):
 
         if self.legacy_inpaint_demos:
             # Legacy: random mask type sampling (old behavior)
-            masked_input, mask = random_inpaint_mask(
+            masked_input, mask, tf_mask = random_inpaint_mask(
                 demo_reals, padding_masks=padding_masks,
                 mask_padding=mask_padding,
                 **module.inpaint_mask_kwargs
@@ -810,6 +863,7 @@ class DiffusionCondInpaintDemoCallback(pl.Callback):
             # New: forced mask types per config
             all_masks = []
             all_masked_inputs = []
+            all_tf_masks = []
             idx = 0
             for config_key, mask_type in self._mask_type_map.items():
                 count = self.inpaint_demo_config.get(config_key, 0)
@@ -817,21 +871,28 @@ class DiffusionCondInpaintDemoCallback(pl.Callback):
                     continue
                 subset_reals = demo_reals[idx:idx+count]
                 subset_padding = padding_masks[idx:idx+count]
-                mi, m = random_inpaint_mask(
+                mi, m, tfm = random_inpaint_mask(
                     subset_reals, padding_masks=subset_padding,
                     mask_padding=mask_padding, force_mask_type=mask_type,
                     **module.inpaint_mask_kwargs
                 )
                 all_masks.append(m)
                 all_masked_inputs.append(mi)
+                all_tf_masks.append(tfm)
                 idx += count
 
             mask = torch.cat(all_masks, dim=0)
             masked_input = torch.cat(all_masked_inputs, dim=0)
+            tf_mask = torch.cat(all_tf_masks, dim=0)
 
         conditioning = module.diffusion.conditioner(metadata, module.device)
         conditioning['inpaint_mask'] = [mask]
         conditioning['inpaint_masked_input'] = [masked_input]
+        # Demos have to see the same conditioning training sees, otherwise a streamgen model
+        # is demoed as if it were the text-only baseline and the demos say nothing about
+        # whether the accompaniment is being followed.
+        conditioning['tf_inpaint_mask'] = [tf_mask]
+        module._add_streamgen_conditioning(conditioning, metadata, tf_mask)
 
         cond_inputs = module.diffusion.get_conditioning_inputs(conditioning)
 
@@ -1034,19 +1095,20 @@ class DiffusionCondInpaintDemoCallback(pl.Callback):
                             ).to(module.device)
 
                             if self.legacy_inpaint_demos:
-                                masked_input, mask = random_inpaint_mask(
+                                masked_input, mask, tf_mask = random_inpaint_mask(
                                     inpaint_reals, padding_masks=inpaint_padding_masks,
                                     mask_padding=mask_padding, **module.inpaint_mask_kwargs
                                 )
                             else:
                                 all_masks = []
                                 all_masked_inputs = []
+                                all_tf_masks = []
                                 idx = 0
                                 for config_key, mask_type in self._mask_type_map.items():
                                     count = self.inpaint_demo_config.get(config_key, 0)
                                     if count == 0:
                                         continue
-                                    mi, m = random_inpaint_mask(
+                                    mi, m, tfm = random_inpaint_mask(
                                         inpaint_reals[idx:idx+count],
                                         padding_masks=inpaint_padding_masks[idx:idx+count],
                                         mask_padding=mask_padding, force_mask_type=mask_type,
@@ -1054,9 +1116,11 @@ class DiffusionCondInpaintDemoCallback(pl.Callback):
                                     )
                                     all_masks.append(m)
                                     all_masked_inputs.append(mi)
+                                    all_tf_masks.append(tfm)
                                     idx += count
                                 mask = torch.cat(all_masks, dim=0)
                                 masked_input = torch.cat(all_masked_inputs, dim=0)
+                                tf_mask = torch.cat(all_tf_masks, dim=0)
 
                             with torch.no_grad():
                                 inpaint_teacher_cond = teacher_ref.conditioner(inpaint_metadata, module.device)

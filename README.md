@@ -208,6 +208,14 @@ audio_out = ae.decode(latents)
 
 See [Autoencoder Workflows](docs/workflows/autoencoder.md) for encoding batches, chunked processing, and pre-encoding datasets for LoRA training.
 
+**Sanity-checking a pre-encoded dataset** — Pass `--sanity_check_samples N` to `scripts/pre_encode_dataset.py` to decode the first N encoded items back to audio into `<output_path>/_sanity_check/`, alongside the audio that went into the encoder (`scripts/decode_preencoded_samples.py` does the same for latents already on disk). Then build a local page to listen to them with mel spectrograms:
+
+```bash
+uv run python scripts/make_listening_page.py --dir ./latents_out/_sanity_check
+```
+
+This writes an `index.html` next to the wavs, pairing each source with its reconstruction. See [Autoencoder Workflows](docs/workflows/autoencoder.md#sanity-checking-a-pre-encoded-dataset) for details.
+
 ## CLI
 
 A `stable-audio` cli is included for running generation without writing any Python.

@@ -71,14 +71,24 @@ from stable_audio_3.data.utils import (
 )
 
 
-def load_model(model_name: str, device: torch.device):
+def load_model(model_name: str, device: torch.device, model_config_path: str = None):
+    """Build the model from `model_name`'s pretrained weights.
+
+    `model_config_path` overrides the architecture config shipped with the checkpoint,
+    which is how extra conditioning (e.g. streamgen's modular local conds) gets added to
+    a pretrained model. Weights are copied with copy_state_dict, which skips keys the
+    checkpoint doesn't have, so newly added modules keep their initialization.
+    """
     if model_name not in models:
         raise ValueError(
             f"Unknown model '{model_name}'. Valid choices: {list(models)}"
         )
     model_cfg = models[model_name]
     local_config, local_ckpt = model_cfg.resolve()
-    with open(local_config) as f:
+    config_path = model_config_path or local_config
+    if model_config_path:
+        print(f"Using model config override: {model_config_path}")
+    with open(config_path) as f:
         model_config = json.load(f)
     model = create_diffusion_cond_from_config(model_config)
     copy_state_dict(model, load_file(local_ckpt))
@@ -118,7 +128,7 @@ def train(args):
     pl.seed_everything(seed, workers=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model, model_config = load_model(args.model, device)
+    model, model_config = load_model(args.model, device, args.model_config)
 
     sample_rate = model.sample_rate
     ds_ratio = model.pretransform.downsampling_ratio
@@ -176,6 +186,14 @@ def train(args):
     if args.freeze_conditioner and hasattr(model, "conditioner"):
         model.conditioner.requires_grad_(False)
 
+    # Inpainting settings come from the model config when it supplies them, so that
+    # mask_type_probabilities / future_visibility can be set per-experiment alongside
+    # the conditioning they belong to.
+    inpainting_config = model_config.get("training", {}).get(
+        "inpainting", {"mask_kwargs": {"mask_type_probabilities": [0.1, 0.8, 0.1]}}
+    )
+    print(f"Inpainting config: {inpainting_config}")
+
     training_wrapper = DiffusionCondTrainingWrapper(
         model,
         mask_loss_weight=1.0,
@@ -187,7 +205,7 @@ def train(args):
         optimizer_configs=optimizer_config,
         timestep_sampler="trunc_logit_normal",
         timestep_sampler_options={},
-        inpainting_config={"mask_kwargs": {"mask_type_probabilities": [0.1, 0.8, 0.1]}},
+        inpainting_config=inpainting_config,
         use_effective_length_for_schedule=True,
         sample_rate=model_config.get("sample_rate", 44100),
         sample_size=model_config.get("sample_size"),
@@ -309,6 +327,15 @@ def main():
         choices=list(models),
         default="medium-base",
         help="Pretrained model to start from",
+    )
+    p.add_argument(
+        "--model_config",
+        default=None,
+        help=(
+            "Path to a model config JSON that overrides the one bundled with the checkpoint. "
+            "Use to add conditioning to a pretrained model, e.g. "
+            "stable_audio_3/configs/model_configs/small_music_streamgen.json"
+        ),
     )
     p.add_argument(
         "--dataset_config",

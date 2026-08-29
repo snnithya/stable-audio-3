@@ -99,6 +99,10 @@ class StableAudioModel:
         inpaint_mask=None,
         inpaint_mask_start_seconds: tp.Optional[tp.Union[float, tp.List[float]]] = None,
         inpaint_mask_end_seconds: tp.Optional[tp.Union[float, tp.List[float]]] = None,
+        # Streamgen: accompaniment to play along to
+        streamgen_audio: tp.Optional[tp.Tuple[int, torch.Tensor]] = None,
+        streamgen_latent: tp.Optional[torch.Tensor] = None,
+        streamgen_visible_seconds: tp.Optional[float] = None,
         # Schedule options
         duration_padding_sec: float = 6.0,
         apg_scale: float = 1.0,
@@ -139,6 +143,14 @@ class StableAudioModel:
                 for a single region, or a list of floats for multiple non-contiguous regions.
             inpaint_mask_end_seconds: End of the inpaint region in seconds. Can be a float
                 for a single region, or a list of floats matching inpaint_mask_start_seconds.
+            streamgen_audio: Accompaniment to generate along to, as (sample_rate, tensor). Only used
+                by models configured with a "streamgen_latent" modular local cond; encoded to a
+                latent internally.
+            streamgen_latent: Pre-encoded accompaniment latent, as an alternative to streamgen_audio.
+                Shape (channels, frames) or (batch, channels, frames).
+            streamgen_visible_seconds: How much of the accompaniment the model may see, as a prefix
+                in seconds. Defaults to the inpaint mask, i.e. visible exactly where audio context is
+                given. Set explicitly to sweep the lookahead horizon.
             duration_padding_sec: Extra seconds to add when adapting duration (default 6.0).
             apg_scale: APG (Adaptive Projected Guidance) scale. 1.0 = full APG, 0.0 = vanilla CFG.
             dist_shift: Optional distribution shift override for sampling. If None, uses model.sampling_dist_shift.
@@ -294,6 +306,20 @@ class StableAudioModel:
 
         conditioning_tensors["inpaint_mask"] = [mask]
         conditioning_tensors["inpaint_masked_input"] = [inpaint_input]
+
+        if "streamgen_latent" in self.model.modular_local_cond_ids:
+            self._add_streamgen_conditioning(
+                conditioning_tensors,
+                streamgen_audio=streamgen_audio,
+                streamgen_latent=streamgen_latent,
+                streamgen_visible_seconds=streamgen_visible_seconds,
+                inpaint_mask=mask,
+                audio_sample_size=audio_sample_size,
+                latent_sample_size=latent_sample_size,
+                batch_size=batch_size,
+                device=device,
+            )
+
         conditioning_inputs = self.model.get_conditioning_inputs(conditioning_tensors)
 
         if negative_conditioning_tensors:
@@ -421,6 +447,61 @@ class StableAudioModel:
             target_audio_samples = ((target_audio_samples + align - 1) // align) * align
 
         return min(target_audio_samples, sample_size)
+
+    def _add_streamgen_conditioning(
+        self,
+        conditioning_tensors,
+        streamgen_audio,
+        streamgen_latent,
+        streamgen_visible_seconds,
+        inpaint_mask,
+        audio_sample_size,
+        latent_sample_size,
+        batch_size,
+        device,
+    ):
+        """Attach the accompaniment latent and its visibility mask to the conditioning.
+
+        Mirrors what the training wrapper does, so train and inference agree on both the
+        gating polarity and the fact that tf_inpaint_mask is supplied explicitly.
+
+        The visibility mask defaults to the inpaint mask (the accompaniment is visible
+        exactly where audio context is given). `streamgen_visible_seconds` overrides it with
+        an explicit prefix horizon, which is how you sweep lookahead at inference.
+        """
+        if streamgen_latent is None:
+            if streamgen_audio is None:
+                raise ValueError(
+                    "This model expects streamgen conditioning: pass streamgen_audio "
+                    "(sample_rate, tensor) or a pre-encoded streamgen_latent."
+                )
+            streamgen_latent, _ = self._encode_audio_input(streamgen_audio, audio_sample_size)
+
+        streamgen_latent = streamgen_latent.to(device)
+        if streamgen_latent.ndim == 2:
+            streamgen_latent = streamgen_latent.unsqueeze(0)
+        if streamgen_latent.shape[0] == 1 and batch_size > 1:
+            streamgen_latent = streamgen_latent.repeat(batch_size, 1, 1)
+
+        # Trim or zero-pad to the generation length so the control lines up frame-for-frame.
+        n = streamgen_latent.shape[-1]
+        if n > latent_sample_size:
+            streamgen_latent = streamgen_latent[..., :latent_sample_size]
+        elif n < latent_sample_size:
+            streamgen_latent = torch.nn.functional.pad(
+                streamgen_latent, (0, latent_sample_size - n)
+            )
+
+        if streamgen_visible_seconds is None:
+            tf_mask = inpaint_mask
+        else:
+            frames_per_second = self.model.sample_rate / self.model.pretransform.downsampling_ratio
+            horizon = max(0, min(latent_sample_size, int(streamgen_visible_seconds * frames_per_second)))
+            tf_mask = torch.zeros((batch_size, 1, latent_sample_size), device=device)
+            tf_mask[:, :, :horizon] = 1
+
+        conditioning_tensors["tf_inpaint_mask"] = [tf_mask]
+        conditioning_tensors["streamgen_latent"] = [streamgen_latent * tf_mask]
 
     def _encode_audio_input(self, audio_input, audio_sample_size, inpaint_mask=None):
         """

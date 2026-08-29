@@ -115,3 +115,76 @@ Pass the output directory to `train_lora.py` via `--encoded_dir`. See [LoRA trai
 | `--sample_size` | `12582912` | Samples to pad/crop to (default ~380s at 44.1kHz)|
 | `--model_half` | off | Run the autoencoder in fp16 to reduce memory |
 | `--pad` | off | Pad/crop audio to `--sample_size` (required for `--batch_size > 1`) |
+| `--sanity_check_samples` | `0` | Decode this many encoded items back to audio for a listening check |
+| `--sanity_check_dir` | `<output_path>/_sanity_check` | Where those wavs are written |
+
+## Sanity-checking a pre-encoded dataset
+
+Encoding is easy to get subtly wrong — a resample that never happened, a control
+sidecar cropped out of sync with its target, a caption attached to the wrong clip —
+and none of it shows up until a training run has already burned GPU hours. The
+cheapest check is to listen.
+
+### During encoding
+
+Pass `--sanity_check_samples N` to decode the first N items straight back to audio
+as they are encoded:
+
+```bash
+uv run python scripts/pre_encode_dataset.py \
+  --dataset_config stable_audio_3/configs/dataset_configs/dataset2preencoding/my_dataset.json \
+  --sanity_check_samples 3
+```
+
+Wavs land in `<output_path>/_sanity_check/` (override with `--sanity_check_dir`):
+
+```
+_sanity_check/
+  0000000000_source.wav                        ← exactly what went into the encoder
+  0000000000_decoded.wav                       ← the saved latent, decoded back
+  0000000000_control_streamgen_audio_source.wav
+  0000000000_control_streamgen_audio_decoded.wav
+```
+
+The `_source.wav` is the tensor the encoder actually saw — post resample, pad/crop and
+channel conversion — not a re-read of the original file, so a mismatch between the two
+is a real encoding problem rather than a loading artifact. Each pair is trimmed to the
+length the stored latent covers, so without `--pad` you hear the truncated region only.
+
+### After encoding
+
+`scripts/decode_preencoded_samples.py` does the same thing for latents already on disk,
+and it takes either config in the workflow — the `dataset2preencoding/` one you encoded
+with (it reads latents from that config's `output_path`, and picks up `model` and
+`controls` from it), the `preencoded/` training config, or a bare latents directory:
+
+```bash
+uv run python scripts/decode_preencoded_samples.py \
+  --config stable_audio_3/configs/dataset_configs/dataset2preencoding/my_dataset.json \
+  --out /tmp/preencode_check -n 5
+```
+
+Here `_source.wav` is the matching slice of the original audio file, offset by the crop
+the training dataset applied, which makes this the version to use when you want to check
+crop alignment as the model will see it. Add `--full` to decode the whole stored latent
+instead of a training-length crop.
+
+### Listening to them
+
+`scripts/make_listening_page.py` turns a directory of those wavs into a local HTML page
+with a player and a mel spectrogram per file:
+
+```bash
+uv run python scripts/make_listening_page.py --dir ./latents_out/_sanity_check
+```
+
+It writes `index.html` and `_mels/*.png` into that directory, referencing the wavs in
+place — open it directly, or `python -m http.server -d <dir> 8000` when working over SSH.
+Each sample becomes one card with its source stacked above its reconstruction (controls
+below), all spectrograms plotted on a single page-wide dB range so level and bandwidth
+differences are visible rather than normalized away. Click a spectrogram to seek and
+play from that point; only one clip sounds at a time.
+
+For a numerical rather than aural check of control alignment, use
+`scripts/check_streamgen_alignment.py`, which cross-correlates a decoded target and its
+control against the source audio and fails if either peak lands off lag 0.

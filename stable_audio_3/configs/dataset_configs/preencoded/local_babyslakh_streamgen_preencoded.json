@@ -1,0 +1,15 @@
+{
+    "dataset_type": "pre_encoded",
+    "datasets": [
+        {
+            "id": "babyslakh-streamgen-local",
+            "path": "/data/hai-res/shared/snnithya/sao-3/data/babyslakh-streamgen-preencoded-same-s/",
+            "custom_metadata_module": "stable_audio_3/configs/dataset_configs/custom_metadata/custom_md_slakh.py"
+        }
+    ],
+    "latent_crop_length": 256,
+    "random_crop": true,
+    "controls": ["streamgen_latent"],
+    "controls_dim": [256],
+    "_comment": "BabySlakh pre-encoded with the streamgen accompaniment control. 'controls'/'controls_dim' split the fused {id}_controls.npy sidecar back into named streams and MUST match the channel order used at pre-encode time (see dataset2preencoding/local_babyslakh_streamgen.json). Uses the plain slakh metadata fn: the accompaniment is already baked into the sidecar, so no stem loading happens at train time."
+}
