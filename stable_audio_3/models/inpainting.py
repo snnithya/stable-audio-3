@@ -111,6 +111,52 @@ def _generate_random_spans_mask(
     return item_mask
 
 
+def build_causal_tf_mask(
+    inpaint_mask: torch.Tensor,
+    padding_masks: torch.Tensor,
+    future_visibility: int,
+) -> torch.Tensor:
+    """Rebuild a tf_inpaint_mask for an *existing* causal inpaint mask at a fixed lookahead.
+
+    random_inpaint_mask draws the generation cursor and the lookahead horizon together, so
+    calling it twice to compare two lookaheads also re-rolls the cursor. This derives the
+    horizon from a mask that already exists instead, which is what lets the same sample with
+    the same cursor be evaluated at several tf values.
+
+    Args:
+        inpaint_mask: Causal inpaint mask, (b, 1, sequence_length), 1 on the provided prefix.
+        padding_masks: (b, sequence_length), 1 for real latents and 0 for silence padding.
+        future_visibility: Lookahead horizon in latent frames relative to the cursor.
+                           Negative values place the horizon before the cursor.
+
+    Returns:
+        tf_inpaint_mask, (b, 1, sequence_length), 1 up to the horizon and 0 after it.
+    """
+    b, _, sequence_length = inpaint_mask.shape
+    real_lens = padding_masks.sum(dim=-1).long()
+
+    tf_masks_list = []
+    for i in range(b):
+        real_sequence_length = int(real_lens[i].item())
+
+        if real_sequence_length == 0:
+            # Matches random_inpaint_mask, which leaves an all-real-padding item untouched.
+            tf_masks_list.append(inpaint_mask[i:i+1].clone())
+            continue
+
+        # For a causal mask the cursor is just the length of the leading run of ones.
+        unmasked_prefix_len = int(inpaint_mask[i, 0, :real_sequence_length].sum().item())
+        horizon = max(0, min(real_sequence_length, unmasked_prefix_len + future_visibility))
+
+        tf_item_mask = torch.ones(
+            (1, 1, sequence_length), device=inpaint_mask.device, dtype=inpaint_mask.dtype
+        )
+        tf_item_mask[:, :, horizon:] = 0
+        tf_masks_list.append(tf_item_mask)
+
+    return torch.cat(tf_masks_list, dim=0)
+
+
 def random_inpaint_mask(
     sequence: torch.Tensor,
     padding_masks: torch.Tensor,

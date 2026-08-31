@@ -4,6 +4,7 @@ from pytorch_lightning.loggers import WandbLogger, CometLogger
 import os
 import torch
 import gc
+import tempfile
 import typing as tp
 import torchaudio
 
@@ -15,9 +16,9 @@ from torch.nn import functional as F
 from ..interface.aeiou import audio_spectrogram_image
 from ..inference.sampling import truncated_logistic_normal_rescaled, sample_timesteps_logsnr, sample_timesteps_logsnr_uniform, sample_diffusion
 from ..models.diffusion import ConditionedDiffusionModelWrapper
-from ..models.inpainting import random_inpaint_mask, MaskType
+from ..models.inpainting import random_inpaint_mask, build_causal_tf_mask, MaskType
 from ..models.lora import add_lora, get_lora_params, get_lora_state_dict, LoRAParametrization, get_lora_layers, save_lora_safetensors, resolve_adapter_type, prepare_dora_state_dict, cast_base_to_precision
-from .utils import create_optimizer_from_config, create_scheduler_from_config, log_audio, log_image, log_metric, get_rank, create_augmented_padding_mask, compute_masked_loss, compute_normalized_mse, resize_padding_mask, StaggeredLogger, compute_per_elem_trim, trim_and_concat
+from .utils import create_optimizer_from_config, create_scheduler_from_config, log_audio, log_image, log_demo_table, log_metric, get_rank, create_augmented_padding_mask, compute_masked_loss, compute_normalized_mse, resize_padding_mask, StaggeredLogger, compute_per_elem_trim, trim_and_concat
 from time import time
 
 class Profiler:
@@ -292,7 +293,7 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
         conditioning["streamgen_latent"] = [streamgen]
 
     def training_step(self, batch, batch_idx):
-        reals, metadata = batch
+        reals, metadata = batch # reals (bs, 256, 256)
 
         p = Profiler()
 
@@ -379,6 +380,7 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
             t = torch.where(torch.rand_like(t) < self.p_one_shot, torch.ones_like(t), t)
 
         # Calculate the noise schedule parameters for those timesteps
+        # Note: bot rectified flow and rf_denoiser train with the RF objective, during inference rf_denoiser uses a pingpong sampler where as rectified flow uses and ODE solver.
         if self.diffusion_objective in ["rectified_flow", "rf_denoiser"]:
             alphas, sigmas = 1-t, t
 
@@ -690,6 +692,39 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
             }
             checkpoint['lora_config'] = self.lora_config
 
+def demo_prompt_text(cond):
+    """Best-effort prompt string for a demo table row.
+
+    Dataset metadata sometimes wraps scalar fields in single-element lists (the same
+    wrapping that padding_mask gets), so unwrap before stringifying.
+    """
+    prompt = cond.get("prompt", "")
+    if isinstance(prompt, (list, tuple)):
+        prompt = prompt[0] if len(prompt) == 1 else ", ".join(str(p) for p in prompt)
+    return str(prompt)
+
+
+def save_demo_wavs(audio, prefix, step, sample_rate, out_dir, per_elem_trim=None):
+    """Save each batch element of a decoded audio tensor as its own wav file.
+
+    Per-element wavs are what the wandb demo table needs: the concatenated
+    per-cfg-scale audio is fine for a quick listen but you cannot line a single
+    generation up against its own target and conditioning in it.
+    """
+    paths = []
+    for i in range(audio.shape[0]):
+        clip = audio[i]
+        if per_elem_trim is not None and per_elem_trim[i] is not None:
+            clip = clip[..., :per_elem_trim[i]]
+        clip = clip.to(torch.float32)
+        clip = clip.div(clip.abs().max().clamp(min=1e-8)).clamp(-1, 1)
+        clip = clip.mul(32767).to(torch.int16).cpu()
+        filename = os.path.join(out_dir, f'{prefix}_{step:08}_{i}.wav')
+        torchaudio.save(filename, clip, sample_rate)
+        paths.append(filename)
+    return paths
+
+
 class DiffusionCondInpaintDemoCallback(pl.Callback):
     def __init__(
         self,
@@ -700,6 +735,7 @@ class DiffusionCondInpaintDemoCallback(pl.Callback):
         demo_cfg_scales: tp.Optional[tp.List[int]] = [3, 5, 7],
         demo_conditioning: tp.Optional[tp.List[tp.Dict[str, tp.Any]]] = None,
         inpaint_demo_config: tp.Optional[tp.Dict[str, int]] = None,
+        demo_tf_values: tp.Optional[tp.List[float]] = None,
         num_demos: int = 0,
         demo_dl=None,
     ):
@@ -710,6 +746,9 @@ class DiffusionCondInpaintDemoCallback(pl.Callback):
         self.sample_rate = sample_rate
         self.demo_cfg_scales = demo_cfg_scales
         self.demo_conditioning = demo_conditioning or []
+        # Fixed teacher-forcing lookaheads (seconds) to spread causal demos over.
+        # None means "use the extremes of the training future_visibility range".
+        self.demo_tf_values = demo_tf_values
         self.last_demo_step = -1
 
         # Map config keys to MaskType enum
@@ -748,10 +787,41 @@ class DiffusionCondInpaintDemoCallback(pl.Callback):
 
         self._teacher_demo_done = False
 
-    def _generate_prompt_demos(self, module, trainer, is_rank_zero=True):
+    def _resolve_demo_tf_values(self, module):
+        """Fixed tf (teacher-forcing lookahead) values every causal demo is generated at.
+
+        tf is the streamgen lookahead horizon relative to the generation cursor: it decides
+        how far past the cursor the accompaniment stays visible. Training samples it per item
+        from `inpainting.future_visibility`, so demos pin it to the extremes of that range
+        instead, which brackets the behaviour the model was trained on. `demo_tf_values`
+        (seconds) overrides the derived values.
+
+        Returns a list of (frames, seconds) pairs, empty when the model has no lookahead
+        conditioning at all.
+        """
+        ds_ratio = module.diffusion.pretransform.downsampling_ratio if module.diffusion.pretransform is not None else 1
+        frames_per_second = self.sample_rate / ds_ratio
+
+        if self.demo_tf_values is not None:
+            return [(int(v * frames_per_second), float(v)) for v in self.demo_tf_values]
+
+        future_visibility = getattr(module, "inpaint_mask_kwargs", {}).get("future_visibility", None)
+        if future_visibility is None:
+            return []
+
+        if isinstance(future_visibility, (list, tuple)):
+            # The upper bound is exclusive when sampled per item, but as a fixed value it is
+            # the honest upper extreme, so use both endpoints as-is.
+            frames = sorted({int(future_visibility[0]), int(future_visibility[1])})
+        else:
+            frames = [int(future_visibility)]
+
+        return [(f, round(f / frames_per_second, 2)) for f in frames]
+
+    def _generate_prompt_demos(self, module, trainer, is_rank_zero=True, demo_dir=None):
         """Generate full t2m demos from specified prompts (FULL_MASK)."""
         if not self.demo_conditioning:
-            return [], []
+            return [], [], []
 
         demo_cond = self.demo_conditioning
         num_demos = len(demo_cond)
@@ -782,6 +852,9 @@ class DiffusionCondInpaintDemoCallback(pl.Callback):
 
         all_audio = []
         all_context_masks = []
+        table_data = []
+        log_rows = is_rank_zero and demo_dir is not None
+        prompts = [demo_prompt_text(c) for c in demo_cond]
 
         for cfg_scale in self.demo_cfg_scales:
             if is_rank_zero:
@@ -807,6 +880,24 @@ class DiffusionCondInpaintDemoCallback(pl.Callback):
                     decode=True
                 )
 
+            if log_rows:
+                output_paths = save_demo_wavs(
+                    fakes, f'demo_prompt_cfg_{cfg_scale}_output', trainer.global_step,
+                    self.sample_rate, demo_dir, per_elem_trim
+                )
+                for i, output_path in enumerate(output_paths):
+                    table_data.append({
+                        'cfg_scale': cfg_scale,
+                        'mask_type': 'prompt (full mask)',
+                        'tf_seconds': None,
+                        'prompt': prompts[i] if i < len(prompts) else '',
+                        'target_audio_path': None,
+                        'streamgen_audio_path': None,
+                        'inpaint_prefix_path': None,
+                        'output_path': output_path,
+                        'sample_rate': self.sample_rate,
+                    })
+
             fakes = trim_and_concat(fakes, per_elem_trim)
 
             all_audio.append(fakes)
@@ -822,12 +913,123 @@ class DiffusionCondInpaintDemoCallback(pl.Callback):
         del noise, conditioning, cond_inputs, inpaint_mask, inpaint_masked_input
         torch.cuda.empty_cache()
 
-        return all_audio, all_context_masks
+        return all_audio, all_context_masks, table_data
 
-    def _generate_inpaint_demos(self, module, trainer, is_rank_zero=True):
+    def _build_inpaint_demo_batch(self, module, demo_reals, metadata, padding_masks, mask_padding):
+        """Build the masks for one round of inpainting demos.
+
+        Causal demos are generated once per tf value, so the returned batch can be larger
+        than the one handed in: demo_reals/metadata/padding_masks are returned alongside the
+        masks because they are duplicated to match.
+
+        Returns:
+            (demo_reals, metadata, padding_masks, mask, masked_input, tf_mask,
+             mask_type_labels, tf_labels, row_sources)
+
+        row_sources maps each output row to the row that owns its tf-invariant audio (its
+        target and inpaint prefix), so paired rows can share one decode and one wav file.
+        """
+        if self.legacy_inpaint_demos:
+            # Legacy: random mask type sampling (old behavior)
+            masked_input, mask, tf_mask = random_inpaint_mask(
+                demo_reals, padding_masks=padding_masks,
+                mask_padding=mask_padding,
+                **module.inpaint_mask_kwargs
+            )
+            mask_type_labels = ['random'] * demo_reals.shape[0]
+            # tf is sampled per item inside random_inpaint_mask here, so there is no
+            # single value to report.
+            tf_labels = [None] * demo_reals.shape[0]
+            row_sources = list(range(demo_reals.shape[0]))
+        else:
+            # New: forced mask types per config
+            all_reals = []
+            all_padding = []
+            all_metadata = []
+            all_masks = []
+            all_masked_inputs = []
+            all_tf_masks = []
+            mask_type_labels = []
+            tf_labels = []
+            row_sources = []
+            # Causal demos are generated once per tf value (by default the two extremes of the
+            # training range). The mask is drawn once per sample and the tf masks are derived
+            # from it, so the paired rows share audio, prompt and cursor position and differ
+            # only in how far the accompaniment stays visible. Other mask types ignore tf.
+            tf_values = self._resolve_demo_tf_values(module)
+            idx = 0
+            for config_key, mask_type in self._mask_type_map.items():
+                count = self.inpaint_demo_config.get(config_key, 0)
+                if count == 0:
+                    continue
+
+                subset_reals = demo_reals[idx:idx+count]
+                subset_padding = padding_masks[idx:idx+count]
+                subset_metadata = metadata[idx:idx+count]
+                idx += count
+
+                paired_tf = tf_values if (mask_type == MaskType.CAUSAL_MASK and tf_values) else []
+
+                # Let random_inpaint_mask pick the cursor, but not the horizon: the horizon is
+                # what we are varying, so it is rebuilt per tf value from the mask it returns.
+                mask_kwargs = dict(module.inpaint_mask_kwargs)
+                if paired_tf:
+                    mask_kwargs.pop('future_visibility', None)
+
+                mi, m, tfm = random_inpaint_mask(
+                    subset_reals, padding_masks=subset_padding,
+                    mask_padding=mask_padding, force_mask_type=mask_type,
+                    **mask_kwargs
+                )
+
+                if not paired_tf:
+                    all_reals.append(subset_reals)
+                    all_padding.append(subset_padding)
+                    all_metadata.extend(subset_metadata)
+                    all_masks.append(m)
+                    all_masked_inputs.append(mi)
+                    all_tf_masks.append(tfm)
+                    mask_type_labels.extend([mask_type.name.lower()] * count)
+                    tf_labels.extend([None] * count)
+                    row_sources.extend(range(len(row_sources), len(row_sources) + count))
+                    continue
+
+                # Interleave so each sample's tf variants land next to each other, both in the
+                # demo table and in the concatenated demo audio.
+                reps = len(paired_tf)
+                tf_variants = [
+                    build_causal_tf_mask(m, subset_padding, frames) for frames, _ in paired_tf
+                ]
+                all_reals.append(subset_reals.repeat_interleave(reps, dim=0))
+                all_padding.append(subset_padding.repeat_interleave(reps, dim=0))
+                all_metadata.extend([md for md in subset_metadata for _ in range(reps)])
+                all_masks.append(m.repeat_interleave(reps, dim=0))
+                all_masked_inputs.append(mi.repeat_interleave(reps, dim=0))
+                all_tf_masks.append(torch.stack(tf_variants, dim=1).flatten(0, 1))
+                mask_type_labels.extend([mask_type.name.lower()] * (count * reps))
+                tf_labels.extend([seconds for _ in range(count) for _, seconds in paired_tf])
+                # Every tf variant of a sample points at the first row of its pair.
+                first_row = len(row_sources)
+                row_sources.extend(
+                    first_row + (i * reps) for i in range(count) for _ in range(reps)
+                )
+
+            # The batch grows when causal demos are paired, so everything downstream
+            # (conditioning, trims, decoded reference audio) works off these copies.
+            demo_reals = torch.cat(all_reals, dim=0)
+            padding_masks = torch.cat(all_padding, dim=0)
+            metadata = all_metadata
+            mask = torch.cat(all_masks, dim=0)
+            masked_input = torch.cat(all_masked_inputs, dim=0)
+            tf_mask = torch.cat(all_tf_masks, dim=0)
+
+        return (demo_reals, metadata, padding_masks, mask, masked_input, tf_mask,
+                mask_type_labels, tf_labels, row_sources)
+
+    def _generate_inpaint_demos(self, module, trainer, is_rank_zero=True, demo_dir=None):
         """Generate inpainting demos from batch data with forced mask types."""
         if self.num_inpaint_demos == 0 or self.demo_dl is None:
-            return [], []
+            return [], [], []
 
         demo_reals, metadata = next(self.demo_dl)
 
@@ -852,38 +1054,10 @@ class DiffusionCondInpaintDemoCallback(pl.Callback):
             padding_masks = resize_padding_mask(padding_masks, demo_reals.shape[-1])
         mask_padding = module.diffusion.mask_padding_attention
 
-        if self.legacy_inpaint_demos:
-            # Legacy: random mask type sampling (old behavior)
-            masked_input, mask, tf_mask = random_inpaint_mask(
-                demo_reals, padding_masks=padding_masks,
-                mask_padding=mask_padding,
-                **module.inpaint_mask_kwargs
-            )
-        else:
-            # New: forced mask types per config
-            all_masks = []
-            all_masked_inputs = []
-            all_tf_masks = []
-            idx = 0
-            for config_key, mask_type in self._mask_type_map.items():
-                count = self.inpaint_demo_config.get(config_key, 0)
-                if count == 0:
-                    continue
-                subset_reals = demo_reals[idx:idx+count]
-                subset_padding = padding_masks[idx:idx+count]
-                mi, m, tfm = random_inpaint_mask(
-                    subset_reals, padding_masks=subset_padding,
-                    mask_padding=mask_padding, force_mask_type=mask_type,
-                    **module.inpaint_mask_kwargs
-                )
-                all_masks.append(m)
-                all_masked_inputs.append(mi)
-                all_tf_masks.append(tfm)
-                idx += count
-
-            mask = torch.cat(all_masks, dim=0)
-            masked_input = torch.cat(all_masked_inputs, dim=0)
-            tf_mask = torch.cat(all_tf_masks, dim=0)
+        (demo_reals, metadata, padding_masks, mask, masked_input, tf_mask,
+         mask_type_labels, tf_labels, row_sources) = self._build_inpaint_demo_batch(
+            module, demo_reals, metadata, padding_masks, mask_padding
+        )
 
         conditioning = module.diffusion.conditioner(metadata, module.device)
         conditioning['inpaint_mask'] = [mask]
@@ -918,6 +1092,59 @@ class DiffusionCondInpaintDemoCallback(pl.Callback):
 
         all_audio = []
         all_context_masks = []
+        table_data = []
+        log_rows = is_rank_zero and demo_dir is not None
+        prompts = [demo_prompt_text(md) for md in metadata]
+
+        # Per-sample reference audio for the demo table: the ground truth the model is
+        # trying to match, the context it was given, and the accompaniment it is
+        # supposed to be following. Decoded once and reused across cfg scales.
+        #
+        # The target and the prefix do not depend on tf, so tf-paired rows would otherwise
+        # decode and upload the same wav twice. Decode only the canonical row of each pair
+        # and let the other rows point at the same file.
+        unique_rows = sorted(set(row_sources))
+        row_to_unique = {row: i for i, row in enumerate(unique_rows)}
+        unique_trim = [per_elem_trim[r] for r in unique_rows] if per_elem_trim is not None else None
+
+        target_paths, prefix_paths, streamgen_paths = [], [], []
+        if log_rows:
+            pretransform = module.diffusion.pretransform
+            with torch.amp.autocast("cuda"):
+                unique_reals = demo_reals[unique_rows]
+                target_decoded = pretransform.decode(unique_reals) if pretransform is not None else unique_reals
+                target_paths = save_demo_wavs(
+                    target_decoded, 'demo_target', trainer.global_step,
+                    self.sample_rate, demo_dir, unique_trim
+                )
+                del target_decoded, unique_reals
+
+                unique_masked = masked_input[unique_rows]
+                prefix_decoded = pretransform.decode(unique_masked) if pretransform is not None else unique_masked
+                prefix_paths = save_demo_wavs(
+                    prefix_decoded, 'demo_inpaint_prefix', trainer.global_step,
+                    self.sample_rate, demo_dir, unique_trim
+                )
+                del prefix_decoded, unique_masked
+
+                if 'streamgen_latent' in conditioning:
+                    # Already gated by tf_mask in _add_streamgen_conditioning, so this is
+                    # exactly what the model sees, silence beyond the lookahead included.
+                    # It differs per tf value, so unlike the target it stays per row.
+                    streamgen_latent = conditioning['streamgen_latent'][0]
+                    streamgen_decoded = pretransform.decode(streamgen_latent) if pretransform is not None else streamgen_latent
+                    streamgen_paths = save_demo_wavs(
+                        streamgen_decoded, 'demo_streamgen', trainer.global_step,
+                        self.sample_rate, demo_dir, per_elem_trim
+                    )
+                    del streamgen_decoded
+            torch.cuda.empty_cache()
+
+        def _reference_path(paths, row):
+            """Path of a tf-invariant reference wav for a table row."""
+            if not paths:
+                return None
+            return paths[row_to_unique[row_sources[row]]]
 
         for cfg_scale in self.demo_cfg_scales:
             if is_rank_zero:
@@ -943,6 +1170,24 @@ class DiffusionCondInpaintDemoCallback(pl.Callback):
                     decode=True
                 )
 
+            if log_rows:
+                output_paths = save_demo_wavs(
+                    fakes, f'demo_inpaint_cfg_{cfg_scale}_output', trainer.global_step,
+                    self.sample_rate, demo_dir, per_elem_trim
+                )
+                for i, output_path in enumerate(output_paths):
+                    table_data.append({
+                        'cfg_scale': cfg_scale,
+                        'mask_type': mask_type_labels[i] if i < len(mask_type_labels) else '',
+                        'tf_seconds': tf_labels[i] if i < len(tf_labels) else None,
+                        'prompt': prompts[i] if i < len(prompts) else '',
+                        'target_audio_path': _reference_path(target_paths, i),
+                        'streamgen_audio_path': streamgen_paths[i] if i < len(streamgen_paths) else None,
+                        'inpaint_prefix_path': _reference_path(prefix_paths, i),
+                        'output_path': output_path,
+                        'sample_rate': self.sample_rate,
+                    })
+
             fakes = trim_and_concat(fakes, per_elem_trim)
 
             all_audio.append(fakes)
@@ -951,7 +1196,7 @@ class DiffusionCondInpaintDemoCallback(pl.Callback):
         del noise, conditioning, cond_inputs, mask, masked_input, padding_masks, demo_reals
         torch.cuda.empty_cache()
 
-        return all_audio, all_context_masks
+        return all_audio, all_context_masks, table_data
 
     @torch.no_grad()
     def on_train_batch_end(self, trainer, module: DiffusionCondTrainingWrapper, outputs, batch, batch_idx):
@@ -964,13 +1209,20 @@ class DiffusionCondInpaintDemoCallback(pl.Callback):
 
         self.last_demo_step = trainer.global_step
 
+        # Per-sample wavs for the wandb demo table live here and are cleaned up on exit.
+        demo_dir_ctx = tempfile.TemporaryDirectory(prefix="demo_table_") if is_rank_zero else None
+        demo_dir = demo_dir_ctx.name if demo_dir_ctx is not None else None
+
         try:
             # Generate both types of demos, freeing intermediates between phases
-            prompt_audio, prompt_masks = self._generate_prompt_demos(module, trainer, is_rank_zero)
+            prompt_audio, prompt_masks, prompt_rows = self._generate_prompt_demos(module, trainer, is_rank_zero, demo_dir)
             torch.cuda.empty_cache()
 
-            inpaint_audio, inpaint_masks = self._generate_inpaint_demos(module, trainer, is_rank_zero)
+            inpaint_audio, inpaint_masks, inpaint_rows = self._generate_inpaint_demos(module, trainer, is_rank_zero, demo_dir)
             torch.cuda.empty_cache()
+
+            if is_rank_zero:
+                log_demo_table(trainer.logger, prompt_rows + inpaint_rows, trainer.global_step)
 
             # Combine per cfg scale (prompt_audio and inpaint_audio have one entry per cfg scale)
             if is_rank_zero:
@@ -1202,6 +1454,8 @@ class DiffusionCondInpaintDemoCallback(pl.Callback):
                 print(f'{type(e).__name__}: {e}')
             raise e
         finally:
+            if demo_dir_ctx is not None:
+                demo_dir_ctx.cleanup()
             gc.collect()
             torch.cuda.empty_cache()
             module.train()            

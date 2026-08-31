@@ -268,13 +268,28 @@ def train(args):
         )
     demo_dl = itertools.cycle([demo_batch])
 
+    # Demo settings come from the model config's "training.demo" block; CLI
+    # flags (where they exist) take precedence, then these defaults.
+    demo_config = model_config.get("training", {}).get("demo", {})
+    demo_every = args.demo_every or demo_config.get("demo_every", 500)
+    demo_steps = demo_config.get("demo_steps", 50)
+    demo_cfg_scales = demo_config.get("demo_cfg_scales", [2, 4, 7])
+    num_demos = demo_config.get("num_demos", 4)
+    print(
+        f"Demo settings: every={demo_every} steps={demo_steps} "
+        f"cfg_scales={demo_cfg_scales} num_demos={num_demos}"
+    )
+
     demo_callback = DiffusionCondInpaintDemoCallback(
-        demo_every=args.demo_every,
+        demo_every=demo_every,
         sample_size=model_config.get("sample_size"),
         sample_rate=model_config.get("sample_rate"),
-        demo_steps=50,
-        num_demos=4,
-        demo_cfg_scales=[2, 4, 7],
+        demo_steps=demo_steps,
+        num_demos=num_demos,
+        demo_cfg_scales=demo_cfg_scales,
+        demo_conditioning=demo_config.get("demo_conditioning"),
+        inpaint_demo_config=demo_config.get("inpaint_demo_config"),
+        demo_tf_values=demo_config.get("demo_tf_values"),
         demo_dl=demo_dl,
     )
 
@@ -414,13 +429,18 @@ def main():
     )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--logger", choices=["wandb", "comet", "csv", "none"], default="wandb")
-    p.add_argument("--project", type=str, default="sao-3")
+    p.add_argument("--project", type=str, default="sat-zenon-sao-3")
     p.add_argument("--name", type=str, default="test")
     p.add_argument("--group", type=str, default="debug")
     p.add_argument("--save_dir", type=str, default="/data/scratch-fast/snnithya/sao-3/ft_checkpoints/debug")
     p.add_argument("--checkpoint_every", type=int, default=500)
     p.add_argument("--log_every", type=int, default=100)
-    p.add_argument("--demo_every", type=int, default=500)
+    p.add_argument(
+        "--demo_every",
+        type=int,
+        default=None,
+        help="Overrides training.demo.demo_every in the model config (default 500).",
+    )
     p.add_argument("--num_workers", type=int, default=8)
     args = p.parse_args()
     if not args.dataset_config and not args.encoded_dir and not args.data_dir:

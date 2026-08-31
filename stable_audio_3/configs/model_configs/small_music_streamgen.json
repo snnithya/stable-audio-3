@@ -298,26 +298,11 @@
             "demo_every": 1000,
             "demo_steps": 8,
             "demo_cfg_scales": [
-                1
+                4
             ],
-            "demo_cond": [
-                {
-                    "prompt": "A beautiful piano arpeggio grows into a grand cinematic climax",
-                    "seconds_total": 119
-                },
-                {
-                    "prompt": "Elegant and sophisticated Latin jazz piece with a Cuban base",
-                    "seconds_total": 100
-                },
-                {
-                    "prompt": "Amen break 174 BPM",
-                    "seconds_total": 9
-                },
-                {
-                    "prompt": "lofi house loop",
-                    "seconds_total": 35
-                }
-            ]
+            "inpaint_demo_config": {
+                "num_causal": 4
+            }
         }
     }
 }

@@ -127,6 +127,39 @@ def log_audio(logger, key, audio_path, sample_rate, caption=None, step=None):
     elif isinstance(logger, CometLogger):
         logger.experiment.log_audio(audio_path, file_name=key, sample_rate=sample_rate, step=step)
 
+def log_demo_table(logger, table_data, step):
+    """Log one row per demo sample with its target, conditioning and generated audio.
+
+    Only wandb supports embedding audio in tables; for other loggers this is a no-op
+    (the concatenated per-cfg-scale audio is still logged separately).
+    """
+    if not table_data or not isinstance(logger, WandbLogger):
+        return
+
+    # tf_seconds is the streamgen lookahead horizon relative to the generation cursor;
+    # None for rows where it does not apply (prompt / non-causal demos).
+    columns = ['step', 'cfg_scale', 'mask_type', 'tf_seconds', 'prompt', 'target', 'streamgen_audio', 'inpaint_prefix', 'output']
+    table = wandb.Table(columns=columns)
+
+    def _audio(path, sample_rate):
+        return wandb.Audio(path, sample_rate=sample_rate) if path else None
+
+    for row in table_data:
+        sr = row['sample_rate']
+        table.add_data(
+            step,
+            row.get('cfg_scale'),
+            row.get('mask_type', ''),
+            row.get('tf_seconds'),
+            row.get('prompt', ''),
+            _audio(row.get('target_audio_path'), sr),
+            _audio(row.get('streamgen_audio_path'), sr),
+            _audio(row.get('inpaint_prefix_path'), sr),
+            _audio(row.get('output_path'), sr),
+        )
+
+    logger.experiment.log({'demo_samples': table})
+
 def log_image(logger, key, img_data, step=None):
     if isinstance(logger, WandbLogger):
         logger.experiment.log({key: wandb.Image(img_data)})

@@ -28,14 +28,16 @@
                 "--model",
                 "small-music",
                 "--dataset_config",
-                "${workspaceFolder}/stable_audio_3/configs/dataset_configs/preencoded/local_babyslakh_preencoded.json",
+                "${workspaceFolder}/stable_audio_3/configs/dataset_configs/preencoded/local_babyslakh_streamgen_preencoded.json",
+                "--model_config",
+                "${workspaceFolder}/stable_audio_3/configs/model_configs/small_music_streamgen.json",
                 "--save_dir",
                 "/data/scratch-fast/snnithya/sao-3/ft_checkpoints/debug",
             ],
             "console": "integratedTerminal",
             "justMyCode": true,
             "env": {
-                "CUDA_VISIBLE_DEVICES": "2"
+                "CUDA_VISIBLE_DEVICES": "0"
             }
         },
         {

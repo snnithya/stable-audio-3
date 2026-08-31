@@ -7,9 +7,9 @@
             "custom_metadata_module": "stable_audio_3/configs/dataset_configs/custom_metadata/custom_md_slakh.py"
         }
     ],
-    "latent_crop_length": 256,
+    "latent_crop_length": 130,
     "random_crop": false,
-    "controls": [],
-    "controls_dim": [],
+    "controls": ["streamgen_audio"],
+    "controls_dim": [256],
     "_comment": "Local config for pre-encoded BabySlakh latents (for collaborators)."
 }
