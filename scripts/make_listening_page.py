@@ -1,9 +1,15 @@
 """Build a local HTML page for listening to sanity-check wavs with mel spectrograms.
 
 Point it at a directory of wavs written by pre_encode_dataset.py --sanity_check_samples
-or by decode_preencoded_samples.py. Files are grouped by the id before the first
-underscore, so each sample's source / decoded / control variants land on one card,
-stacked for A/B comparison with a shared time axis.
+or by decode_preencoded_samples.py. Files are grouped by sample id, so each sample's
+source / decoded / control streams land on one card, stacked for A/B comparison with a
+shared time axis.
+
+An augmentation variant is its own sample here, not another stream of one. Ids written
+for a dataset encoded with --augment_variants carry a `_v<n>` suffix, and that suffix
+stays with the id: n logged samples across N variants give n x N cards, each showing the
+pitch/tempo roll it was written with. Grouping the variants together instead would stack
+four unrelated renderings of a track on one card and break the source/decoded pairing.
 
 The page is plain HTML referencing the wavs in place, so open it from the same
 directory (file:// works; over SSH, `python -m http.server` in that directory).
@@ -16,6 +22,7 @@ import argparse
 import html
 import json
 import math
+import re
 from pathlib import Path
 
 import matplotlib
@@ -25,14 +32,31 @@ import torchaudio
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
-# Order variants source-first so the ground truth sits above its reconstruction.
-VARIANT_ORDER = ["source", "decoded"]
+# Order streams source-first so the ground truth sits above its reconstruction.
+STREAM_ORDER = ["source", "decoded"]
+
+# `<id>` or `<id>_v<n>`, followed by the stream label. The non-greedy first branch is what
+# keeps an augmentation-variant suffix on the id side of the split; the second is the
+# unaugmented case, where there is no `_v<n>` to find.
+STEM_RE = re.compile(r"^(?P<id>.+?_v\d+|[^_]+)_(?P<label>.+)$")
 
 
-def variant_sort_key(label):
+def split_stem(stem):
+    """Split a wav stem into (sample_id, stream_label).
+
+    The `_v<n>` augmentation suffix belongs to the id: `0000000000_v2_decoded` is the
+    decode of variant 2, a different sample from variant 0, and gets its own card.
+    """
+    m = STEM_RE.match(stem)
+    if not m:
+        return stem, "audio"
+    return m.group("id"), m.group("label")
+
+
+def stream_sort_key(label):
     base = label.split("_")[-1]
     return (0 if not label.startswith("control") else 1,
-            VARIANT_ORDER.index(base) if base in VARIANT_ORDER else len(VARIANT_ORDER),
+            STREAM_ORDER.index(base) if base in STREAM_ORDER else len(STREAM_ORDER),
             label)
 
 
@@ -84,8 +108,8 @@ def build(args):
 
     groups = {}
     for wav in wavs:
-        sample_id, _, label = wav.stem.partition("_")
-        groups.setdefault(sample_id, []).append((label or "audio", wav))
+        sample_id, label = split_stem(wav.stem)
+        groups.setdefault(sample_id, []).append((label, wav))
 
     cards = []
     for sample_id, items in groups.items():
@@ -97,10 +121,18 @@ def build(args):
             meta_bits.append(f"src: {md['path']}")
         if md.get("seconds_total"):
             meta_bits.append(f"{md['seconds_total']}s total")
+        aug = md.get("augmentation")
+        if aug:
+            # Written per item by pre_encode_dataset.py, so the card says which roll it is
+            # rather than leaving you to guess from the sound.
+            meta_bits.append(
+                f"aug v{aug.get('variant')}: rate {aug.get('time_stretch_rate', 1.0):.3f}, "
+                f"{aug.get('pitch_semitones', 0.0):+.2f} st ({aug.get('pitch_scope')})"
+            )
         meta = html.escape(" · ".join(meta_bits))
 
         rows = []
-        for label, wav in sorted(items, key=lambda it: variant_sort_key(it[0])):
+        for label, wav in sorted(items, key=lambda it: stream_sort_key(it[0])):
             duration = specs[wav.name][1]
             rows.append(f"""
       <div class="row" data-duration="{duration:.4f}">

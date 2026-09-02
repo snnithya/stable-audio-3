@@ -15,8 +15,10 @@ The submix is stochastic: a random subset of the available stems, each normalize
 random loudness. This mirrors sat-zenon's load_and_mix_stems so the model sees a range of
 arrangement densities and balances rather than one fixed full mix.
 
-NOTE: because pre-encoding caches the result, the randomness is rolled ONCE per track and
-then frozen. Re-rolling per epoch requires moving the mix to train time.
+NOTE: because pre-encoding caches the result, the randomness is rolled once per track *per
+pre-encode pass* and then frozen. `--augment_variants N` makes N passes, so an N-variant
+dataset holds N different submixes per track — but that is still N rolls, not a fresh roll
+per epoch, which would require moving the mix to train time.
 """
 
 import random

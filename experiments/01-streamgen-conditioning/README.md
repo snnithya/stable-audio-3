@@ -64,6 +64,7 @@ is a **no-op at step 0** and the pretrained checkpoint is not disturbed at the s
 | 1.1 | [Data + wiring validation](01-data-and-wiring.md) | Does the accompaniment latent reach the model correctly aligned? | **complete** |
 | 1.2 | [Baseline finetune](02-baseline-finetune.md) | Does conditioning reduce loss / improve alignment vs. text-only? | **implemented, not run** |
 | 1.3 | Lookahead sweep | How does `future_visibility` affect musicality and anticipation? | not started |
+| 1.4 | [Pitch + time augmentation](03-pitch-time-augmentation.md) | Does widening the key/tempo distribution at pre-encode time help, and does alignment survive it? | **implemented, not trained on** |
 
 ## Results
 
@@ -80,13 +81,22 @@ design and the run order.
 
 **1.3.** Not yet started.
 
+**1.4 (implemented, not trained on).** `--augment_variants N` writes N differently
+transposed / re-paced copies of a split at pre-encode time. Drums and accompaniment share
+one time-stretch rate so they stay frame-aligned (verified at lag 0 on augmented items), and
+by default share the pitch shift too, so a variant is the whole arrangement in a new key.
+`--augment_pitch_scope controls` holds the drums at their original tuning if the shared shift
+turns out to teach a key/tuning correlation. See [1.4](03-pitch-time-augmentation.md).
+
 ## Notes
 
 - The data for 1.2 onwards is **Slakh2100** (`streamgen-drum-mirror`, official splits), not
   BabySlakh. BabySlakh remains the smoke-test path for plumbing changes.
 - The submix is currently **frozen per cached track** (rolled once at pre-encode time). Intent is to
   move mixing to train/inference time so the stem subset and levels are re-rolled — otherwise every
-  epoch sees an identical accompaniment per track, which limits augmentation diversity.
+  epoch sees an identical accompaniment per track, which limits augmentation diversity. Partial
+  mitigation since 1.4: each `--augment_variants` pass re-runs the metadata fn, so an N-variant
+  dataset holds N different submixes per track. That is N rolls, not a fresh roll per epoch.
 - `modular_local_cond` is duplicated for batched CFG but **not** CFG-dropped
   (`models/dit.py:440-450`), so streamgen is an always-on control. Making it CFG-guidable is a
   deliberate follow-up, not part of the first pass.

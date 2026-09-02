@@ -54,6 +54,7 @@ uv sync --extra flash
 | **LoRA CLI** | `scripts/train_lora.py`, `docs/workflows/lora.md` |
 | **Dataset + metadata** | `stable_audio_3/data/dataset.py`, JSON under `stable_audio_3/configs/dataset_configs/`, `custom_metadata/*.py` |
 | **Pre-encode latents** | `scripts/pre_encode_dataset.py` |
+| **Pitch / time-stretch augmentation** | `stable_audio_3/data/augmentation.py`, `scripts/pre_encode_dataset.py --augment_variants N` |
 | **Sanity-check a pre-encoded dataset** | `scripts/pre_encode_dataset.py --sanity_check_samples N`, `scripts/decode_preencoded_samples.py`, `scripts/make_listening_page.py`, `scripts/check_streamgen_alignment.py` |
 | **DiT / CFG in forward** | `stable_audio_3/models/dit.py` (`cfg_scale`, `apg_scale`, `scale_phi`, `cfg_interval`, …) |
 | **Sampling / schedulers** | `stable_audio_3/inference/sampling.py` (`sample_diffusion`, sampler types) |

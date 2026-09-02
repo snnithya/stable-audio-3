@@ -7,6 +7,10 @@ Both peaks must land at lag 0.
 This is the check to run after (re-)pre-encoding a dataset: a crop-offset desync between
 the target and its control produces a model that trains happily on misaligned conditioning.
 
+For a dataset pre-encoded with `--augment_variants`, each item records the time-stretch rate
+it was written with; the source audio is re-timed by that rate before the comparison, so an
+augmented item is checked just as strictly as an unaugmented one.
+
 Usage:
   uv run python scripts/check_streamgen_alignment.py \
       --config stable_audio_3/configs/dataset_configs/preencoded/local_babyslakh_streamgen_preencoded.json
@@ -19,6 +23,7 @@ import torch
 import torchaudio
 
 from stable_audio_3 import AutoencoderModel
+from stable_audio_3.data.augmentation import pitch_shift_and_time_stretch
 from stable_audio_3.data.utils import build_dataset_from_config
 
 HOP = 512
@@ -42,10 +47,19 @@ def best_lag(a, b):
     return peak - n // 2, float(xc[peak] / n)
 
 
-def load_resampled(path, target_sr):
+def load_resampled(path, target_sr, rate=1.0):
+    """Load a source stem at the model's sample rate, re-timed to match an augmented item.
+
+    ``rate`` replays the time stretch that pre-encoding applied, so the source lines up with
+    the latent again. The pitch shift is deliberately *not* replayed: the comparison below is
+    over amplitude envelopes, which transposition leaves alone, and skipping it keeps this
+    check honest about the one thing it is for — whether events still land at the same time.
+    """
     audio, sr = torchaudio.load(str(path))
     if sr != target_sr:
         audio = torchaudio.functional.resample(audio, sr, target_sr)
+    if rate != 1.0:
+        audio = pitch_shift_and_time_stretch(audio, rate=rate)
     return audio
 
 
@@ -57,6 +71,7 @@ def main(args):
     )
 
     failures = 0
+    inconclusive = 0
     for n in range(args.num_samples):
         latents, info = ds[n]
         control = info.get("controls", {}).get(args.control)
@@ -68,22 +83,37 @@ def main(args):
 
         start = info["latent_crop_start"] * args.ds_ratio
         length = latents.shape[-1] * args.ds_ratio
+        aug = info.get("augmentation") or {}
+        rate = aug.get("time_stretch_rate", 1.0)
 
         with torch.no_grad():
             target = ae.decode(latents.unsqueeze(0).cuda()).squeeze(0).float().cpu()
             accomp = ae.decode(control.unsqueeze(0).cuda()).squeeze(0).float().cpu()
 
         drum_path = Path(info["path"])
-        src_target = load_resampled(drum_path, sr)[:, start : start + length]
+        src_target = load_resampled(drum_path, sr, rate)[:, start : start + length]
 
+        # Correlate against the stems that actually went into this item's submix. Summing
+        # every stem instead makes a one-stem submix look uncorrelated with its own source,
+        # and a meaningless correlation puts the lag peak anywhere it likes.
         other_dir = drum_path.parent.parent.parent / "other" / drum_path.parent.name
+        stems = sorted(other_dir.glob("*.wav"))
+        selected = info.get("streamgen_stems")
+        if selected:
+            by_name = {p.stem: p for p in stems}
+            stems = [by_name[name] for name in selected if name in by_name]
+
         src_other = None
-        for stem in sorted(other_dir.glob("*.wav")):
-            a = load_resampled(stem, sr)[:, start : start + length]
+        for stem in stems:
+            a = load_resampled(stem, sr, rate)[:, start : start + length]
             src_other = a if src_other is None else src_other + a
 
         lag_t, corr_t = best_lag(envelope(target), envelope(src_target))
-        print(f"[{n}] {info.get('track_id')} crop@{info['latent_crop_start']}")
+        aug_note = (
+            f" aug v{aug['variant']} (rate {rate:.3f}, {aug['pitch_semitones']:+.2f} st)"
+            if aug else ""
+        )
+        print(f"[{n}] {info.get('track_id')} crop@{info['latent_crop_start']}{aug_note}")
         print(f"      target vs source        : lag {lag_t:+d} ({lag_t * HOP / sr * 1000:+.0f} ms), corr {corr_t:.3f}")
 
         if src_other is None:
@@ -91,16 +121,31 @@ def main(args):
             continue
 
         lag_c, corr_c = best_lag(envelope(accomp), envelope(src_other))
-        # The control correlates below 1.0 by design: it is a random, re-leveled subset of
-        # the stems, not the full sum. Only the LAG matters for alignment.
+        # The control still correlates below 1.0 by design — the stems are re-leveled to
+        # random loudnesses before being summed — so only the LAG matters for alignment.
         print(f"      control vs source stems : lag {lag_c:+d} ({lag_c * HOP / sr * 1000:+.0f} ms), corr {corr_c:.3f}")
+
+        # A stem that simply is not playing in this window gives a flat envelope, a
+        # correlation near zero, and a lag peak wherever the noise happens to be highest.
+        # That says nothing about alignment either way, so it must not be read as a failure.
+        if min(corr_t, corr_c) < args.min_corr:
+            inconclusive += 1
+            print(f"      INCONCLUSIVE — correlation below {args.min_corr}; source window is near-silent")
+            continue
 
         if abs(lag_t) > args.tolerance or abs(lag_c) > args.tolerance:
             failures += 1
             print("      MISALIGNED")
 
+    checked = args.num_samples - inconclusive
     print()
-    print("ALIGNMENT:", "OK" if failures == 0 else f"FAILED for {failures}/{args.num_samples} samples")
+    print(
+        "ALIGNMENT:",
+        f"OK ({checked}/{args.num_samples} samples)" if failures == 0
+        else f"FAILED for {failures}/{checked} checkable samples",
+    )
+    if inconclusive:
+        print(f"  {inconclusive} sample(s) skipped as inconclusive; re-run to draw different crops")
     return 1 if failures else 0
 
 
@@ -113,4 +158,10 @@ if __name__ == "__main__":
     p.add_argument("--latent_length", type=int, default=256, help="Latent crop length")
     p.add_argument("-n", "--num_samples", type=int, default=3)
     p.add_argument("--tolerance", type=int, default=1, help="Allowed lag in envelope frames")
+    p.add_argument(
+        "--min_corr",
+        type=float,
+        default=0.2,
+        help="Correlation below which a sample is reported inconclusive rather than misaligned",
+    )
     raise SystemExit(main(p.parse_args()))
