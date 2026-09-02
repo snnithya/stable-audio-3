@@ -1,6 +1,6 @@
 {
     "dataset_type": "audio_dir",
-    "output_path": "/data/scratch-fast/snnithya/sao-3/data/babyslakh-v2",
+    "output_path": "/data/hai-res/shared/snnithya/sao-3/data/babyslakh-streamgen-preencoded-w-augs-same-s",
     "datasets": [
         {
             "id": "babyslakh-streamgen",

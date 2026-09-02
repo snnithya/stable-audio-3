@@ -3,7 +3,7 @@
     "datasets": [
         {
             "id": "babyslakh-streamgen-local",
-            "path": "/data/hai-res/shared/snnithya/sao-3/data/babyslakh-streamgen-preencoded-same-s/",
+            "path": "/data/hai-res/shared/snnithya/sao-3/data/babyslakh-streamgen-preencoded-w-augs-same-s",
             "custom_metadata_module": "stable_audio_3/configs/dataset_configs/custom_metadata/custom_md_slakh.py"
         }
     ],

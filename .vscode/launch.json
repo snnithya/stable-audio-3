@@ -15,6 +15,7 @@
                 "--config",
                 "${workspaceFolder}/stable_audio_3/configs/dataset_configs/preencoded/local_babyslakh_preencoded.json"
             ],
+            "envFile": "${workspaceFolder}/.env",
             "console": "integratedTerminal",
             "justMyCode": true
         },
@@ -26,7 +27,7 @@
             "program": "${workspaceFolder}/scripts/train_finetune.py",
             "args": [
                 "--model",
-                "small-music",
+                "small-music-base",
                 "--dataset_config",
                 "${workspaceFolder}/stable_audio_3/configs/dataset_configs/preencoded/local_babyslakh_streamgen_preencoded.json",
                 "--model_config",
@@ -34,6 +35,7 @@
                 "--save_dir",
                 "/data/scratch-fast/snnithya/sao-3/ft_checkpoints/debug",
             ],
+            "envFile": "${workspaceFolder}/.env",
             "console": "integratedTerminal",
             "justMyCode": true,
             "env": {
@@ -48,7 +50,7 @@
             "program": "${workspaceFolder}/scripts/train_lora.py",
             "args": [
                 "--model",
-                "small-music",
+                "small-music-base",
                 "--dataset_config",
                 "${workspaceFolder}/stable_audio_3/configs/dataset_configs/preencoded/local_babyslakh_streamgen_preencoded.json",
                 "--model_config",
@@ -56,6 +58,7 @@
                 "--save_dir",
                 "/data/scratch-fast/snnithya/sao-3/ft_checkpoints/debug",
             ],
+            "envFile": "${workspaceFolder}/.env",
             "console": "integratedTerminal",
             "justMyCode": true,
             "env": {
@@ -79,6 +82,7 @@
                 "1",
                 "--pad"
             ],
+            "envFile": "${workspaceFolder}/.env",
             "console": "integratedTerminal",
             "justMyCode": true,
             "env": {
