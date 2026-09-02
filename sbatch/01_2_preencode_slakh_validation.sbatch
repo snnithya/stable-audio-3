@@ -1,13 +1,13 @@
 #!/bin/bash
-#SBATCH --job-name=sg-preencode-train-s
+#SBATCH --job-name=sg-preencode-val
 #SBATCH --partition=hai-res-l40s
 #SBATCH --account=hai-res
-#SBATCH --gres=gpu:l40s:4
-#SBATCH --cpus-per-task=32
+#SBATCH --gres=gpu:l40s:2
+#SBATCH --cpus-per-task=16
 #SBATCH --mem=96G
-#SBATCH --time=16:00:00
-#SBATCH --output=/data/scratch-fast/snnithya/sao-3/logs/01_2_preencode.out
-#SBATCH --error=/data/scratch-fast/snnithya/sao-3/logs/01_2_preencode.out
+#SBATCH --time=6:00:00
+#SBATCH --output=/data/scratch-fast/snnithya/sao-3/logs/01_2_preencode_validation.out
+#SBATCH --error=/data/scratch-fast/snnithya/sao-3/logs/01_2_preencode_validation.out
 
 
 set -euo pipefail
@@ -43,7 +43,7 @@ export PYTHONPATH="$PWD"
 
 
 uv run --no-sync --frozen python scripts/pre_encode_dataset.py \
-    --dataset_config "stable_audio_3/configs/dataset_configs/dataset2preencoding/slakh_streamgen_train.json" \
+    --dataset_config "stable_audio_3/configs/dataset_configs/dataset2preencoding/slakh_streamgen_validation.json" \
     --model same-s \
     --batch_size 8 \
     --sample_size 587853

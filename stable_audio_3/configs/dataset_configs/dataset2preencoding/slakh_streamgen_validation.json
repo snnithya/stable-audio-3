@@ -1,10 +1,10 @@
 {
     "dataset_type": "audio_dir",
-    "output_path": "/data/scratch-fast/snnithya/sao-3/data/slakh-streamgen-preencoded/validation/",
+    "output_path": "/data/hai-res/shared/snnithya/sao-3/data/slakh-streamgen-preencoded-same-s/validation/",
     "datasets": [
         {
             "id": "slakh-streamgen-validation",
-            "path": "/data/scratch-fast/snnithya/sat-zenon/data/slakh2100/streamgen-drum-mirror/validation/tracks/drums/",
+            "path": "/data/hai-res/shared/snnithya/sat-zenon-data/slakh2100/streamgen-drum-mirror/validation/tracks/drums",
             "custom_metadata_module": "stable_audio_3/configs/dataset_configs/custom_metadata/custom_md_slakh_streamgen.py"
         }
     ],
@@ -18,7 +18,7 @@
         1.1
     ],
     "augment_pitch_scope": "all",
-    "augment_seed": 0,
+    "augment_seed": 42,
     "sanity_check_samples": 2,
     "_comment": "Slakh2100 validation split, pre-encoded with the streamgen accompaniment control. Same mechanism as local_babyslakh_streamgen.json, on the full corpus with the official Slakh splits, which is what 1.2 needs to say anything about generalization. Pass --sample_size 16760832 on the CLI (4092 latent frames, 380s, covering the 95th percentile track length): pre_encode_dataset.py's merge_config_into_args treats any argparse default that is not None as CLI-supplied, so a 'sample_size' key here would be silently ignored. Run with --batch_size 1 and no --pad so each track keeps its natural length. Augmentation: 'augment_variants' writes that many copies of the split, variant 0 unaugmented and the rest each rolling a time-stretch rate from 'augment_time_stretch' and a pitch shift from +/- 'augment_pitch_semitones'. Both the stretch and the pitch shift go to the drums and the accompaniment with the same values ('augment_pitch_scope': 'all'), so a variant is the whole arrangement in a new key at a new tempo; the shared rate is what keeps the two frame-aligned. Set 'augment_pitch_scope' to 'controls' to hold the drums at their original tuning while still re-keying the accompaniment. Each variant is a fresh pass, so the stochastic stem submix is re-rolled per variant too. Encode time and disk scale with the variant count. Left at 1 on purpose: the held-out split is what the model is scored on, and scoring against pitched/stretched audio measures the augmentation as much as the model. Sanity check: 'sanity_check_samples' is counted PER VARIANT and the dataloader is unshuffled, so 2 x 'augment_variants' items are decoded back to audio into <output_path>/_sanity_check — the same tracks in every variant, so the variants are A/B-able against each other. Build the page with scripts/make_listening_page.py; each variant gets its own card stating the rate and interval it was written with."
 }
