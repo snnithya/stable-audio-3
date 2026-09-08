@@ -6,7 +6,7 @@
 #SBATCH --gres=gpu:l40s:2
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=96G
-#SBATCH --time=6:00:00
+#SBATCH --time=12:00:00
 #SBATCH --output=/data/scratch-fast/snnithya/sao-3/logs/01_2_preencode_validation_%j.out
 #SBATCH --error=/data/scratch-fast/snnithya/sao-3/logs/01_2_preencode_validation_%j.err
 
@@ -50,6 +50,7 @@ export PYTHONPATH="$PWD"
     --model same-s \
     --batch_size 8 \
     --sample_size 587853 \
-    --pad
+    --pad \
+    --max_silence_fraction 0.3 \
 
 echo "finished=$(date -Is)"

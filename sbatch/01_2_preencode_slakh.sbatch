@@ -51,6 +51,6 @@ export PYTHONPATH="$PWD"
     --batch_size 8 \
     --sample_size 587853 \
     --pad \
-    --silence_fraction 0.3\
+    --max_silence_fraction 0.3 \
 
 echo "finished=$(date -Is)"
