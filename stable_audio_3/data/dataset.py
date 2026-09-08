@@ -206,6 +206,7 @@ class SampleDataset(torch.utils.data.Dataset):
         volume_norm_param=(-16, 2),
         strip_silence=False,
         pad=True,
+        resample_on_reject=True,
     ):
         super().__init__()
         self.filenames = []
@@ -221,6 +222,11 @@ class SampleDataset(torch.utils.data.Dataset):
 
         self.pad_crop = PadCrop_Normalized_T(sample_size, sample_rate, randomize=random_crop, pad=pad)
         self.strip_silence = strip_silence
+        # Training wants a rejected item swapped for a usable one so the batch stays full.
+        # Pre-encoding wants the opposite: the swap writes a *duplicate* of some other track
+        # under the rejected item's id, which is indistinguishable from real data downstream.
+        # With this off, rejects are handed to the caller flagged, and the caller drops them.
+        self.resample_on_reject = resample_on_reject
 
         self.force_channels = force_channels
 
@@ -273,7 +279,8 @@ class SampleDataset(torch.utils.data.Dataset):
             audio, t_start, t_end, seconds_start, seconds_total, padding_mask = self.pad_crop(audio)
 
             # Check for silence
-            if is_silence(audio):
+            silent = is_silence(audio)
+            if silent and self.resample_on_reject:
                 return self[random.randrange(len(self))]
 
             # Run augmentations on this sample (including random crop)
@@ -289,6 +296,9 @@ class SampleDataset(torch.utils.data.Dataset):
             info = {}
 
             info["path"] = audio_filename
+            if silent:
+                info["__reject__"] = True
+                info["__reject_reason__"] = "peak below silence threshold"
 
             for root_path in self.root_paths:
                 if root_path in audio_filename:
@@ -304,6 +314,11 @@ class SampleDataset(torch.utils.data.Dataset):
 
             info["load_time"] = end_time - start_time
 
+            # Already rejected: skip the custom metadata fn rather than pay for a submix
+            # (several stem loads and a resample) that is about to be thrown away.
+            if silent:
+                return (audio, info)
+
             for custom_md_path in self.custom_metadata_fns.keys():
                 if custom_md_path in audio_filename:
                     custom_metadata_fn = dill.loads(self.custom_metadata_fns[custom_md_path])
@@ -311,7 +326,11 @@ class SampleDataset(torch.utils.data.Dataset):
                     info.update(custom_metadata)
 
                 if "__reject__" in info and info["__reject__"]:
-                    return self[random.randrange(len(self))]
+                    if self.resample_on_reject:
+                        return self[random.randrange(len(self))]
+                    # No `__audio__` to unpack on a reject, so the caller must check the flag
+                    # before touching any control key.
+                    return (audio, info)
 
                 # Provide audio inputs as their own dictionary to be merged into info, each audio element will be normalized in the same way as the main audio
                 if "__audio__" in info:

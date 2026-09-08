@@ -128,6 +128,66 @@ def strip_trailing_silence(audio, sample_rate, threshold_db=-60, min_silence_dur
     return audio[:, :content_end]
 
 
+DEFAULT_SILENCE_THRESHOLD_DB = -50.0
+
+
+def rms_dbfs(audio: torch.Tensor) -> float:
+    """RMS level of a clip, in dBFS. Digital silence is -inf."""
+    rms = torch.sqrt(torch.mean(audio.float() ** 2))
+    if rms <= 0:
+        return float("-inf")
+    return float(20 * torch.log10(rms))
+
+
+def is_silent(audio: torch.Tensor, threshold_db: float = DEFAULT_SILENCE_THRESHOLD_DB) -> bool:
+    """True if a clip's RMS level sits below `threshold_db` dBFS.
+
+    RMS, not peak. `is_silence` in dataset.py tests the loudest sample in the clip, so one hit
+    anywhere in a six-minute file makes the whole file content; an average cannot be satisfied
+    that cheaply. At the default -50 dBFS this rejects windows that are essentially empty —
+    noise floor, a dead stem, a track that has not started yet. It is *not* a
+    percentage-of-silence test: a window that is 99.9% silence with one full-scale hit
+    averages about -31 dBFS and passes. Use `silence_fraction` for that question.
+
+    Measure it over the *valid* region only. Averaging padding into the level drags it down in
+    proportion to how much of the window the track failed to fill, which would reject short
+    tracks for being short rather than for being empty.
+    """
+    return rms_dbfs(audio) < threshold_db
+
+
+DEFAULT_SILENCE_FRAME_DB = -60.0
+DEFAULT_SILENCE_FRAME_SECONDS = 0.02
+
+
+def silence_fraction(
+    audio: torch.Tensor,
+    sample_rate: int,
+    threshold_db: float = DEFAULT_SILENCE_FRAME_DB,
+    frame_seconds: float = DEFAULT_SILENCE_FRAME_SECONDS,
+) -> float:
+    """Fraction of a clip, in [0, 1], spent in frames whose peak is below `threshold_db`.
+
+    This is the "how much of this is nothing" measure that neither `is_silence` nor
+    `is_silent` gives you. RMS answers a different question: it is an average, so a window
+    that is 99.9% silence with one full-scale hit in it lands around -31 dBFS and clears any
+    reasonable RMS threshold. Only a frame-wise count separates *quiet* from *empty*.
+
+    Framing matches `strip_trailing_silence`: peak per frame across channels, so a frame
+    counts as content if anything in it does.
+    """
+    n_samples = audio.shape[-1]
+    hop = max(1, int(sample_rate * frame_seconds))
+    n_frames = n_samples // hop
+    if n_frames == 0:
+        return float(is_silent(audio, threshold_db))
+
+    frames = audio.float()[:, : n_frames * hop].reshape(audio.shape[0], n_frames, hop)
+    frame_peak = frames.abs().amax(dim=(0, 2))
+    frame_db = 20 * torch.log10(frame_peak + 1e-10)
+    return float((frame_db < threshold_db).float().mean())
+
+
 class PhaseFlipper(nn.Module):
     "Randomly invert the phase of a signal"
     def __init__(self, p=0.5):

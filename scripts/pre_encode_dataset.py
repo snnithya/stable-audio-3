@@ -44,6 +44,31 @@ Config format (mirrors existing dataset JSON configs):
   When multiple datasets are listed, each is encoded into output_path/<dataset_id>/.
   CLI args always take precedence over config file values.
 
+Silence filtering — an item is written only if it has something in it:
+
+  Two checks, both measured over each stream's valid (non-padded) region, and both applied to
+  the target AND to every control. A real drum latent paired with an accompaniment that is
+  silent over that window is a training pair saying the control carries no information, so the
+  control side matters as much as the target.
+
+  --silence_threshold_db (default -50)  RMS floor. Catches windows that are essentially empty
+      — noise floor, a dead stem, a track that never starts. Note what it does *not* catch:
+      RMS is an average, so a window that is 99.9% silence with one full-scale hit measures
+      about -31 dBFS and clears this comfortably. It is a much better test than the peak-based
+      `is_silence` in dataset.py (which one hit anywhere in a six-minute file satisfies), but
+      it is not a percentage-of-silence test.
+  --max_silence_fraction (off by default)  The percentage-of-silence test. Counts 20ms frames
+      whose peak is below --silence_frame_threshold_db (default -60) and drops the item if too
+      many are. Off by default because the right cutoff is corpus-specific.
+
+  Every written item carries a "levels" block in its sidecar JSON — rms_dbfs and
+  silence_fraction for the target and for each control — so a first pass gives you the
+  distribution to choose --max_silence_fraction from rather than a guess.
+
+  A dropped item is dropped, not replaced: its latent id simply does not appear in the output,
+  and `_skipped.json` next to the latents records how many went and why, per variant.
+  Pass --no_silence_filter to write everything (stats are still recorded).
+
 Augmentation — write several differently transposed / differently paced copies of each track,
 so a frozen-latent dataset still shows the model a range of keys and tempos:
   uv run python scripts/pre_encode_dataset.py --dataset_config ... --augment_variants 4
@@ -82,6 +107,12 @@ from stable_audio_3.data.dataset import (
     LocalDatasetConfig,
     SampleDataset,
     collation_fn,
+)
+from stable_audio_3.data.utils import (
+    DEFAULT_SILENCE_FRAME_DB,
+    DEFAULT_SILENCE_THRESHOLD_DB,
+    rms_dbfs,
+    silence_fraction,
 )
 
 
@@ -194,6 +225,11 @@ def encode_dataset(ae, data_dir, output_path, custom_metadata_fn, args):
         # tensors (e.g. the streamgen accompaniment) are cropped in a separate call from
         # the main audio. A deterministic offset is what keeps them time-aligned.
         random_crop=False,
+        # A rejected item must be *dropped*, not swapped for a random other track. The swap
+        # is right for training (it keeps the batch full) and wrong here: it would write a
+        # second copy of some other track under the rejected item's id, and nothing
+        # downstream could tell that copy from real data.
+        resample_on_reject=False,
     )
     loader = torch.utils.data.DataLoader(
         dataset,
@@ -212,6 +248,22 @@ def encode_dataset(ae, data_dir, output_path, custom_metadata_fn, args):
     control_keys = list(args.controls or [])
     variants = max(1, args.augment_variants or 1)
     rate_range = tuple(args.augment_time_stretch)
+    silence_threshold_db = None if args.no_silence_filter else args.silence_threshold_db
+    max_silence_fraction = None if args.no_silence_filter else args.max_silence_fraction
+
+    if silence_threshold_db is None and max_silence_fraction is None:
+        print("Silence filter: OFF — every item is written, level stats still recorded")
+    else:
+        criteria = []
+        if silence_threshold_db is not None:
+            criteria.append(f"RMS >= {silence_threshold_db:g} dBFS")
+        if max_silence_fraction is not None:
+            criteria.append(
+                f"silent frames <= {max_silence_fraction:.0%} "
+                f"(frame peak < {args.silence_frame_threshold_db:g} dBFS)"
+            )
+        print(f"Silence filter: {' and '.join(criteria)}, measured over each stream's valid "
+              f"region and applied to the target and to {len(control_keys)} control(s)")
 
     if variants > 1:
         pitched = "target + controls" if not args.augment_pitch_controls_only else "controls only"
@@ -242,6 +294,8 @@ def encode_dataset(ae, data_dir, output_path, custom_metadata_fn, args):
                   f"{' (unaugmented)' if variant == 0 else ''} ===")
         # Reset per variant so a listening check covers every variant, not just the first.
         sanity_remaining = args.sanity_check_samples or 0
+        skipped = {}
+        written = 0
 
         for nb, (audio, metadata) in enumerate(loader):
             print(f"Processing batch {nb}")
@@ -251,21 +305,40 @@ def encode_dataset(ae, data_dir, output_path, custom_metadata_fn, args):
             gc.collect()
 
             audio = audio.to(device)
+            latent_ids = [latent_id_for(nb, i, variant, variants) for i in range(audio.shape[0])]
+
+            def skip(i, category, detail=None):
+                # The category is what the summary counts, so it must not carry per-item
+                # numbers or every skipped item becomes its own bucket. The numbers go in
+                # `detail`, which only the per-item line shows.
+                print(f"  [{latent_ids[i]}] SKIPPED: {detail or category}"
+                      f" — {metadata[i].get('path', '?')}")
+                skipped[category] = skipped.get(category, 0) + 1
+
+            # The dataset is built with resample_on_reject=False, so a rejected item arrives
+            # here flagged instead of having been silently swapped for a random other track.
+            # Dropping it leaves a gap in the id sequence, which is the intended outcome: ids
+            # stay tied to their position in the file list across re-encodes.
+            keep = []
+            for i, md in enumerate(metadata):
+                if md.get("__reject__"):
+                    skip(i, md.get("__reject_reason__", "rejected by the metadata fn"))
+                else:
+                    keep.append(i)
 
             for key in control_keys:
-                missing = [i for i, md in enumerate(metadata) if key not in md]
+                missing = [i for i in keep if key not in metadata[i]]
                 if missing:
                     raise KeyError(
                         f"Control '{key}' missing from metadata for {len(missing)} item(s) in batch {nb}. "
                         f"The custom_metadata_module must return it under '__audio__'."
                     )
-                for md in metadata:
-                    md[key] = md[key].to(device)
-
-            latent_ids = [latent_id_for(nb, i, variant, variants) for i in range(audio.shape[0])]
+                for i in keep:
+                    metadata[i][key] = metadata[i][key].to(device)
 
             if variant > 0:
-                for i, md in enumerate(metadata):
+                for i in keep:
+                    md = metadata[i]
                     # Seeded per item rather than from a running stream, so re-encoding a
                     # subset of the data reproduces the same rolls it got the first time.
                     params = sample_augmentation_params(
@@ -278,6 +351,66 @@ def encode_dataset(ae, data_dir, output_path, custom_metadata_fn, args):
                         audio[i], md, control_keys, params, args.augment_pitch_controls_only
                     )
                     print(f"  [{latent_ids[i]}] rate {params.rate:.3f}, {params.semitones:+.2f} st")
+
+            # Level check. Runs after augmentation, so what is judged is what is written, and
+            # measures each stream over its valid region rather than the padded window — an
+            # 80s track padded into a 380s window is short, not silent. The target and every
+            # control must clear it: a real drum latent paired with an empty accompaniment is
+            # a training pair that teaches the model the control carries no information.
+            #
+            # The stats are recorded on every item whether or not the filter is on, so the
+            # thresholds for a corpus can be read off a first pass instead of guessed.
+            surviving = []
+            for i in keep:
+                md = metadata[i]
+                valid = int(md["padding_mask"][0].sum().item())
+                streams = [("target", audio[i][:, :valid])]
+                streams += [(key, md[key][:, :valid]) for key in control_keys]
+
+                reason = None
+                levels = {}
+                for name, stream in streams:
+                    level = {
+                        "rms_dbfs": rms_dbfs(stream),
+                        "silence_fraction": silence_fraction(
+                            stream, ae.sample_rate, args.silence_frame_threshold_db
+                        ),
+                    }
+                    levels[name] = level
+                    if reason is not None:
+                        continue
+                    if silence_threshold_db is not None and level["rms_dbfs"] < silence_threshold_db:
+                        reason = (
+                            f"{name} below the RMS floor",
+                            f"{name} RMS {level['rms_dbfs']:.1f} dBFS below the floor",
+                        )
+                    elif (
+                        max_silence_fraction is not None
+                        and level["silence_fraction"] > max_silence_fraction
+                    ):
+                        reason = (
+                            f"{name} over the silence-fraction limit",
+                            f"{name} {level['silence_fraction']:.0%} silent over the encoded window",
+                        )
+
+                # -inf does not survive a JSON round trip; the level is unbounded below anyway.
+                for level in levels.values():
+                    level["rms_dbfs"] = max(level["rms_dbfs"], -200.0)
+                md["levels"] = levels
+
+                if reason:
+                    skip(i, *reason)
+                else:
+                    surviving.append(i)
+            keep = surviving
+
+            if not keep:
+                continue
+
+            if len(keep) < len(metadata):
+                audio = audio[keep]
+                metadata = [metadata[i] for i in keep]
+                latent_ids = [latent_ids[i] for i in keep]
 
             if args.model_half:
                 audio = audio.half()
@@ -328,6 +461,7 @@ def encode_dataset(ae, data_dir, output_path, custom_metadata_fn, args):
                         padding_mask = padding_mask[:valid_length]
 
                 np.save(os.path.join(output_path, f"{latent_id}.npy"), latent_np)
+                written += 1
 
                 if control_latents is not None:
                     control_np = control_latents[i].cpu().numpy()[:, : latent_np.shape[-1]]
@@ -365,6 +499,23 @@ def encode_dataset(ae, data_dir, output_path, custom_metadata_fn, args):
                         print(f"Wrote sanity-check wavs to {sanity_dir}")
                         print(f"  Listen to them: uv run python scripts/make_listening_page.py --dir {sanity_dir}")
 
+        total_skipped = sum(skipped.values())
+        print(f"Variant {variant}: wrote {written} item(s), skipped {total_skipped}")
+        for reason, count in sorted(skipped.items(), key=lambda kv: -kv[1]):
+            print(f"  {count:>6}  {reason}")
+        # Written next to the latents so a dataset can be audited later without re-reading the
+        # job log, which on a multi-hour Slurm run is where this information otherwise dies.
+        # One file for all variants, deliberately: a per-variant name would have to end in
+        # `_v<N>.json`, which is exactly the glob that selects a variant's real items.
+        report_path = os.path.join(output_path, "_skipped.json")
+        report = {}
+        if os.path.exists(report_path):
+            with open(report_path) as f:
+                report = json.load(f)
+        report[f"v{variant}"] = {"written": written, "skipped": skipped}
+        with open(report_path, "w") as f:
+            json.dump(report, f, indent=2)
+
 
 def load_config(config_path: str) -> dict:
     with open(config_path) as f:
@@ -394,6 +545,10 @@ def merge_config_into_args(args, cfg: dict, parser: argparse.ArgumentParser):
         "augment_time_stretch",
         "augment_pitch_scope",
         "augment_seed",
+        "silence_threshold_db",
+        "max_silence_fraction",
+        "silence_frame_threshold_db",
+        "no_silence_filter",
     )
     for key in scalar_keys:
         if key in cfg and key not in cli_supplied:
@@ -549,6 +704,48 @@ if __name__ == "__main__":
         default=None,
         help="Seed for the per-item pitch/tempo rolls (default 0).",
     )
+    parser.add_argument(
+        "--silence_threshold_db",
+        type=float,
+        default=None,
+        help=(
+            "Drop an item whose target — or any of whose controls — has an RMS level below "
+            f"this many dBFS over its valid region (default {DEFAULT_SILENCE_THRESHOLD_DB:g}). "
+            "RMS, not peak: a window that is nearly all silence with one hit in it has a high "
+            "peak and a low RMS, and it is the RMS that says whether the item is worth "
+            "encoding. Dropped items leave a gap in the latent ids rather than being replaced."
+        ),
+    )
+    parser.add_argument(
+        "--max_silence_fraction",
+        type=float,
+        default=None,
+        help=(
+            "Drop an item if more than this fraction of its target — or of any of its controls "
+            "— is silent, counted frame-wise over the valid region. Off by default: the right "
+            "value is corpus-specific, and every item's 'levels' block in the sidecar JSON "
+            "records its silence_fraction, so a first pass tells you the distribution to pick "
+            "from. This is the check RMS cannot make: a window that is 99.9%% silence with one "
+            "full-scale hit still measures about -31 dBFS RMS."
+        ),
+    )
+    parser.add_argument(
+        "--silence_frame_threshold_db",
+        type=float,
+        default=None,
+        help=(
+            "Peak level below which a 20ms frame counts as silent for --max_silence_fraction "
+            f"(default {DEFAULT_SILENCE_FRAME_DB:g})."
+        ),
+    )
+    parser.add_argument(
+        "--no_silence_filter",
+        action="store_true",
+        help=(
+            "Write every item regardless of level; the 'levels' stats are still recorded. "
+            "Items the metadata fn rejects are still dropped."
+        ),
+    )
     args = parser.parse_args()
 
     if args.dataset_config:
@@ -568,6 +765,10 @@ if __name__ == "__main__":
     args.augment_pitch_controls_only = args.augment_pitch_scope != "all"
     if args.augment_seed is None:
         args.augment_seed = 0
+    if args.silence_threshold_db is None:
+        args.silence_threshold_db = DEFAULT_SILENCE_THRESHOLD_DB
+    if args.silence_frame_threshold_db is None:
+        args.silence_frame_threshold_db = DEFAULT_SILENCE_FRAME_DB
 
     if not args.pad and args.batch_size > 1:
         parser.error(

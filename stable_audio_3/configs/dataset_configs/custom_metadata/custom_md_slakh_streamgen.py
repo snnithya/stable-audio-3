@@ -28,12 +28,15 @@ from pathlib import Path
 import torch
 import torchaudio
 
+from stable_audio_3.data.utils import DEFAULT_SILENCE_THRESHOLD_DB, is_silent
+
 # Submix sampling parameters (mirrors sat-zenon's defaults).
 MIN_STEMS = 1
 MAX_STEMS = None  # None = all available stems are eligible
 LUFS_RANGE = (-30.0, -15.0)
 SILENCE_ENERGY_THRESHOLD = 1e-6
 PEAK_CEILING = 0.95
+SILENCE_THRESHOLD_DB = DEFAULT_SILENCE_THRESHOLD_DB
 
 AUDIO_EXTENSIONS = (".wav", ".flac", ".mp3", ".ogg")
 
@@ -85,11 +88,23 @@ def find_other_stems(drum_path):
     return sorted(p for p in other_dir.iterdir() if p.suffix.lower() in AUDIO_EXTENSIONS)
 
 
-def load_and_mix_stems(stem_paths, sample_rate, target_length=None):
+def load_and_mix_stems(
+    stem_paths,
+    sample_rate,
+    target_length=None,
+    silence_threshold_db=SILENCE_THRESHOLD_DB,
+):
     """Load, level, and sum a random subset of the accompaniment stems.
 
     Returns (mix, selected_names). `mix` is a stereo tensor at `sample_rate`, or None if no
     usable (non-silent) stem was found.
+
+    A stem is judged silent *after* it has been cropped to `target_length` — that is, on the
+    window that will actually be encoded, not on the whole file. The distinction is the point
+    of the check: a track whose accompaniment only enters at 2:00 is entirely non-silent as a
+    file and entirely silent over a 30s window starting at 0, and pairing that empty control
+    with a real drum latent is the failure this is here to prevent. Pass `target_length` from
+    the caller's crop or the check reverts to a whole-file one.
     """
     loaded = []
     for stem_path in stem_paths:
@@ -110,8 +125,10 @@ def load_and_mix_stems(stem_paths, sample_rate, target_length=None):
                 audio = torch.nn.functional.pad(audio, (0, target_length - audio.shape[1]))
 
         # Drop silent stems before sampling, so the subset is drawn from stems that
-        # actually contribute something.
-        if torch.mean(audio**2) < SILENCE_ENERGY_THRESHOLD:
+        # actually contribute something. RMS rather than raw energy: the threshold is then
+        # readable in dBFS and comparable with the one the pre-encode script applies to the
+        # target, instead of being an unlabelled 1e-6.
+        if is_silent(audio, silence_threshold_db):
             continue
 
         loaded.append((stem_path.stem, audio))
@@ -133,16 +150,39 @@ def load_and_mix_stems(stem_paths, sample_rate, target_length=None):
     if peak > 1.0:
         mix = mix / peak * PEAK_CEILING
 
+    # Every selected stem cleared the gate individually, but stems can cancel; check the sum
+    # too, since the sum is what gets encoded.
+    if is_silent(mix, silence_threshold_db):
+        return None, []
+
     return mix, [name for name, _ in selected]
+
+
+def target_valid_length(info, audio):
+    """Length in samples of the target's real (non-padded) audio, or None if unknown.
+
+    This is the window the accompaniment has to cover: the drums' padding mask is what the
+    trainer masks with, so accompaniment past the mask's end is encoded into the control and
+    then never attended to. It is also the window the silence check has to be measured over,
+    for the reason in `load_and_mix_stems`.
+    """
+    mask = info.get("padding_mask")
+    if mask:
+        return int(mask[0].sum().item())
+    if audio is not None:
+        return audio.shape[-1]
+    return None
 
 
 def get_custom_metadata(info, audio):
     """Tag the drum stem and attach the accompaniment submix as `streamgen_audio`.
 
-    The mix is returned at its natural length via `__audio__`, so SampleDataset applies the
-    same pad/crop and channel handling it applied to the drums. That shared treatment is
-    what keeps the two time-aligned, and it only holds when the dataset is built with
-    random_crop=False (otherwise each call draws its own crop offset).
+    The mix is built over the target's valid window and returned via `__audio__`, so
+    SampleDataset applies the same pad/crop and channel handling it applied to the drums.
+    That shared treatment is what keeps the two time-aligned, and it only holds when the
+    dataset is built with random_crop=False — both because each call would otherwise draw its
+    own crop offset, and because the stems here are read from sample 0 (there is no offset to
+    read them from otherwise).
     """
     filepath = info["path"]
 
@@ -158,11 +198,16 @@ def get_custom_metadata(info, audio):
     stem_paths = find_other_stems(filepath)
     if not stem_paths:
         # No accompaniment means no streamgen condition, so the sample is useless here.
-        return {"__reject__": True}
+        return {"__reject__": True, "__reject_reason__": "no accompaniment stems"}
 
-    mix, selected_names = load_and_mix_stems(stem_paths, info["sample_rate"])
+    mix, selected_names = load_and_mix_stems(
+        stem_paths, info["sample_rate"], target_length=target_valid_length(info, audio)
+    )
     if mix is None:
-        return {"__reject__": True}
+        return {
+            "__reject__": True,
+            "__reject_reason__": "accompaniment silent over the encoded window",
+        }
 
     metadata["streamgen_stems"] = selected_names
     metadata["__audio__"] = {"streamgen_audio": mix}
