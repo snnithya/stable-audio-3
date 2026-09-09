@@ -3,13 +3,13 @@
     "datasets": [
         {
             "id": "slakh-streamgen-validation",
-            "path": "/data/scratch-fast/snnithya/sao-3/data/slakh-streamgen-preencoded/validation/",
+            "path": "/data/hai-res/shared/snnithya/sao-3/data/slakh-streamgen-preencoded-same-s-wo-silence/validation/",
             "custom_metadata_module": "stable_audio_3/configs/dataset_configs/custom_metadata/custom_md_slakh.py"
         }
     ],
-    "latent_crop_length": 1024,
+    "latent_crop_length": 144,
     "random_crop": false,
     "controls": ["streamgen_latent"],
     "controls_dim": [256],
-    "_comment": "Slakh2100 validation split (270 tracks), held out from training. random_crop is off and the window is long (1024 frames ~= 95s) on purpose: scripts/eval_streamgen.py takes a deterministic centred sub-window from it, so every arm is scored on byte-identical frames. Do not train on this config."
+    "_comment": "Slakh2100 validation split, held out from training, from the silence-filtered encode of 2026-09-08: 56 items, not the 270 tracks in the split -- the rest were dropped as silent over the encoded window (see experiments/01-streamgen-conditioning/04-silence-filtering.md). Every item is exactly 144 latent frames ~= 13.3s (pre-encoded with --sample_size 587853 --pad), so 'latent_crop_length' matches the stored length and nothing is cropped or silence-padded; it was 1024 for the old whole-track encode, which would now pad each item with ~880 frames of silence. random_crop stays off so every arm is scored on byte-identical frames -- scripts/eval_streamgen.py takes a deterministic centred sub-window of --eval_frames (default 256) from this, which at 144 stored frames means the whole item; pass --eval_frames 144 explicitly and remember that --context_seconds 8 then leaves only ~5.4s to score. The old path /data/scratch-fast/snnithya/sao-3/data/slakh-streamgen-preencoded/validation/ predates the silence fix and is 20% duplicated tracks; do not point this back at it. Do not train on this config."
 }

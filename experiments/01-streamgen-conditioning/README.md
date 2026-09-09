@@ -65,7 +65,7 @@ is a **no-op at step 0** and the pretrained checkpoint is not disturbed at the s
 | 1.2 | [Baseline finetune](02-baseline-finetune.md) | Does conditioning reduce loss / improve alignment vs. text-only? | **implemented, not run** |
 | 1.3 | Lookahead sweep | How does `future_visibility` affect musicality and anticipation? | not started |
 | 1.4 | [Pitch + time augmentation](03-pitch-time-augmentation.md) | Does widening the key/tempo distribution at pre-encode time help, and does alignment survive it? | **implemented, not trained on** |
-| 1.5 | [Silence filtering](04-silence-filtering.md) | Which items belong in a pre-encoded dataset, and what happens to the ones that do not? | **implemented, datasets need re-encoding** |
+| 1.5 | [Silence filtering](04-silence-filtering.md) | Which items belong in a pre-encoded dataset, and what happens to the ones that do not? | **Slakh re-encoded — validation done, train running** |
 
 ## Results
 
@@ -89,21 +89,32 @@ by default share the pitch shift too, so a variant is the whole arrangement in a
 `--augment_pitch_scope controls` holds the drums at their original tuning if the shared shift
 turns out to teach a key/tuning correlation. See [1.4](03-pitch-time-augmentation.md).
 
-**1.5 (implemented, datasets need re-encoding).** A rejected item was being *replaced* by a
-random other track rather than dropped, so the pre-encoded sets on disk contain duplicates:
-**55 extra copies in the 270-item Slakh validation split (20%)** and 3 of 20 per BabySlakh
-variant. Rejection now drops. The silence test is also RMS over the encoded window (ported
-from sat-zenon) rather than peak over the whole file, and it is applied to the accompaniment
-as well as the target — a drum latent paired with a silent control was previously written
-without complaint. See [1.5](04-silence-filtering.md); **the Slakh splits must be re-encoded
-before 1.2 is scored on them.**
+**1.5 (Slakh re-encoded 2026-09-08 — validation done, train running).** A rejected item was
+being *replaced* by a random other track rather than dropped, so the pre-encoded sets on disk
+contained duplicates: **55 extra copies in the 270-item Slakh validation split (20%)** and 3
+of 20 per BabySlakh variant. Rejection now drops. The silence test is also RMS over the
+encoded window (ported from sat-zenon) rather than peak over the whole file, and it is
+applied to the accompaniment as well as the target — a drum latent paired with a silent
+control was previously written without complaint.
+
+Both Slakh splits are being re-encoded with the filter on
+(`--max_silence_fraction 0.3`, 13.3s window from the start of each track) into
+`slakh-streamgen-preencoded-same-s-wo-silence/`. **The validation split came out at 56 of 270
+items (21%)** — the fraction limit alone accounts for 121 of the 214 drops, mostly tracks
+whose drums have not entered inside the first 13.3s. The held-out set is therefore 4.8×
+smaller and no longer a uniform sample of Slakh validation; whether 0.3 is the right cutoff
+at this window length is now the open question. See [1.5](04-silence-filtering.md).
 
 ## Notes
 
 - The data for 1.2 onwards is **Slakh2100** (`streamgen-drum-mirror`, official splits), not
   BabySlakh. BabySlakh remains the smoke-test path for plumbing changes.
 - **Every pre-encoded set produced before 2026-09-02 contains duplicate tracks** — see 1.5.
-  Re-encode before drawing conclusions from anything trained or scored on them.
+  Re-encode before drawing conclusions from anything trained or scored on them. The clean
+  Slakh sets live at
+  `/data/hai-res/shared/snnithya/sao-3/data/slakh-streamgen-preencoded-same-s-wo-silence/`,
+  and the `preencoded/slakh_streamgen_*_preencoded.json` configs now point there with
+  `latent_crop_length: 144` to match the 13.3s items.
 - The submix is currently **frozen per cached track** (rolled once at pre-encode time). Intent is to
   move mixing to train/inference time so the stem subset and levels are re-rolled — otherwise every
   epoch sees an identical accompaniment per track, which limits augmentation diversity. Partial

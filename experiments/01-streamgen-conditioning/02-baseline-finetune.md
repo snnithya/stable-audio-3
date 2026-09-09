@@ -58,6 +58,17 @@ streamgen metadata fn expects, so this costs a pre-encode pass and nothing else.
 Source audio is 16 kHz mono, upsampled by the loader (same caveat as 1.1): the fidelity
 ceiling is low, and audio quality judgements from this dataset should be discounted.
 
+**As actually encoded (2026-09-08), the splits are much smaller than those counts.** Both were
+re-encoded with the 1.5 silence filter on — `--max_silence_fraction 0.3` over a 13.3s window
+taken from the start of each track — into
+`/data/hai-res/shared/snnithya/sao-3/data/slakh-streamgen-preencoded-same-s-wo-silence/`.
+**The validation split kept 56 of 270 tracks**; the train run (2 augmentation variants) was
+still going at the time of writing. So the held-out set behind every number below is 56
+items, not 270: the paired comparison is ~2.2× noisier than planned, and the surviving tracks
+are biased towards ones whose drums and accompaniment both start early. See
+[1.5](04-silence-filtering.md) for the full breakdown and for the case for revisiting the
+cutoff or the window length.
+
 ### Metrics
 
 **Held-out loss** — `scripts/eval_streamgen.py`, on the validation split. Every arm is scored
@@ -85,11 +96,14 @@ readable at all. Report where the arms fall between them, never the raw value al
 
 ## How to run
 
-Four steps, in order. None of them has been run yet.
+Four steps, in order. Step 1 has been run (2026-09-08); steps 2-4 have not.
 
 ```bash
-# 1. Pre-encode Slakh train + validation (array task 0 = train, 1 = validation)
-sbatch sbatch/01_2_preencode_slakh.sbatch
+# 1. Pre-encode Slakh train and validation (two separate scripts, not an array)
+sbatch sbatch/01_2_preencode_slakh.sbatch             # train,      4x L40S
+sbatch sbatch/01_2_preencode_slakh_validation.sbatch  # validation, 2x L40S
+#    Then read what the silence filter dropped before going further:
+#    cat <output_path>/_skipped.json
 
 # 2. Verify the control is still time-aligned. Do not skip this after a re-encode --
 #    a crop desync produces conditioning that trains happily and is musically wrong (see 1.1).
@@ -113,7 +127,8 @@ The eval script also runs standalone against an intermediate checkpoint:
 uv run python scripts/eval_streamgen.py \
     --arm cond stable_audio_3/configs/model_configs/small_music_streamgen.json <ckpt> \
     --arm base stable_audio_3/configs/model_configs/small_music_baseline.json <ckpt> \
-    --dataset_config stable_audio_3/configs/dataset_configs/preencoded/slakh_streamgen_validation_preencoded.json
+    --dataset_config stable_audio_3/configs/dataset_configs/preencoded/slakh_streamgen_validation_preencoded.json \
+    --eval_frames 144   # the items are 144 frames; the 256 default silently gives you all of them
 ```
 
 ## Reading the result
@@ -144,7 +159,32 @@ uv run python scripts/eval_streamgen.py \
   `merge_config_into_args` treats any argparse default that is not `None` as
   "CLI-supplied", so a `sample_size` key in the dataset JSON is silently ignored — which
   would have truncated the ~20% of Slakh tracks longer than the 285s default without any
-  warning. The sbatch script passes `--sample_size 16760832` (380s) explicitly.
+  warning. The sbatch scripts pass it explicitly.
+
+- **The encode is a 13.3s window, not a whole track.** The original plan here was
+  `--sample_size 16760832` (380s, `--batch_size 1`, no `--pad`) so each track kept its natural
+  length; the scripts as run pass `--sample_size 587853 --pad --batch_size 8`, giving 144
+  latent frames per item taken from the *start* of the track (`random_crop=False` in the
+  pre-encode path). Two consequences: the eval's `latent_crop_length: 1024` (~95s) in
+  `preencoded/slakh_streamgen_*_preencoded.json` is far longer than what exists, and a 30%
+  silence cutoff is a much stricter test at 13.3s than it would be at 380s (see 1.5).
+
+- **The preencoded configs now point at the filtered encode.**
+  `preencoded/slakh_streamgen_{train,validation}_preencoded.json` were repointed at
+  `slakh-streamgen-preencoded-same-s-wo-silence/<split>/` with `latent_crop_length: 144`,
+  matching the stored length exactly, so neither the crop nor the silence-pad branch of
+  `PreEncodedDataset` fires. They previously named the old `/data/scratch-fast/...`
+  encode — the one with 20% duplicates in validation — at `latent_crop_length` 256 (train)
+  and 1024 (validation), which against 144-frame latents would have silence-padded every
+  item. Verified by loading both: validation 56 items, train 350 and climbing while the
+  encode runs, `[256, 144]` latent and control, `latent_crop_start` 0.
+
+- **`--eval_frames` needs to come down.** It defaults to 256 (23.8s) in
+  `scripts/eval_streamgen.py`, and the centred crop against a 144-frame item just returns
+  the whole 144 frames — no error, but the window is not what the flag says. Worse,
+  `--context_seconds 8` (86 frames) then leaves only ~5.4s of the item to actually score.
+  Pass `--eval_frames 144` and pick a context length deliberately, or re-encode the
+  validation split at a longer window.
 
 - **The submix is still frozen per cached track.** Rolled once at pre-encode time, as in 1.1.
   Every epoch sees the same accompaniment for a given track. This limits augmentation

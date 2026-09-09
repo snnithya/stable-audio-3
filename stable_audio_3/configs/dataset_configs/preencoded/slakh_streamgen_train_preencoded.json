@@ -3,13 +3,13 @@
     "datasets": [
         {
             "id": "slakh-streamgen-train",
-            "path": "/data/scratch-fast/snnithya/sao-3/data/slakh-streamgen-preencoded/train/",
+            "path": "/data/hai-res/shared/snnithya/sao-3/data/slakh-streamgen-preencoded-same-s/train/",
             "custom_metadata_module": "stable_audio_3/configs/dataset_configs/custom_metadata/custom_md_slakh.py"
         }
     ],
-    "latent_crop_length": 256,
+    "latent_crop_length": 144,
     "random_crop": true,
     "controls": ["streamgen_latent"],
     "controls_dim": [256],
-    "_comment": "Slakh2100 train split (1289 tracks, ~89h of drums), pre-encoded with the streamgen accompaniment control. 256 latent frames ~= 23.8s per item, randomly cropped each epoch. 'controls'/'controls_dim' split the fused {id}_controls.npy sidecar and MUST match the channel order used at pre-encode time."
+    "_comment": "Slakh2100 train split, pre-encoded with the streamgen accompaniment control, from the silence-filtered encode of 2026-09-08 (see experiments/01-streamgen-conditioning/04-silence-filtering.md). Every item is exactly 144 latent frames ~= 13.3s, because the pre-encode ran with --sample_size 587853 --pad, so 'latent_crop_length' matches the stored length and neither the crop nor the silence-pad branch of PreEncodedDataset fires; 'random_crop' is therefore a no-op today and is left on only so it takes effect if the split is ever re-encoded at a longer window. Raising 'latent_crop_length' above 144 would NOT lengthen the items -- it would pad every one of them with the silence latent. The old path /data/scratch-fast/snnithya/sao-3/data/slakh-streamgen-preencoded/train/ predates the silence fix and contains duplicated tracks; do not point this back at it. 'controls'/'controls_dim' split the fused {id}_controls.npy sidecar and MUST match the channel order used at pre-encode time."
 }

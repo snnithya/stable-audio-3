@@ -41,6 +41,11 @@ uv sync --extra flash
 
 <!-- TODO: fill in your machine(s), CUDA version, typical data roots -->
 - **Data roots:**: /data/hai-res/shared/snnithya/sat-zenon-data/babyslakh-preencoded/
+  - Slakh2100 source stems: /data/hai-res/shared/snnithya/sat-zenon-data/slakh2100/streamgen-drum-mirror/<split>/
+  - Streamgen latents, silence-filtered (2026-09-08, the current ones):
+    /data/hai-res/shared/snnithya/sao-3/data/slakh-streamgen-preencoded-same-s-wo-silence/<split>/
+    Anything under .../slakh-streamgen-preencoded/ predates the fix in
+    experiments/01-streamgen-conditioning/04-silence-filtering.md and contains duplicate tracks.
 - **Checkpoint / log dirs:**: /data/scratch-fast/snnithya/sao-3/
 
 ---
@@ -55,6 +60,8 @@ uv sync --extra flash
 | **Dataset + metadata** | `stable_audio_3/data/dataset.py`, JSON under `stable_audio_3/configs/dataset_configs/`, `custom_metadata/*.py` |
 | **Pre-encode latents** | `scripts/pre_encode_dataset.py` |
 | **Pitch / time-stretch augmentation** | `stable_audio_3/data/augmentation.py`, `scripts/pre_encode_dataset.py --augment_variants N` |
+| **Compare autoencoders (SAME-S vs SAME-L)** | `scripts/compare_autoencoders.py`, `experiments/02-autoencoder-choice/` (2.1 on bryan-data-1, 2.2 on babySlakh) |
+| **Stage a submix mirror (Slakh `other` as the pipeline mixes it)** | `scripts/make_submix_mirror.py`, `custom_metadata/custom_md_slakh_streamgen.py` (`load_and_mix_stems`) |
 | **Sanity-check a pre-encoded dataset** | `scripts/pre_encode_dataset.py --sanity_check_samples N`, `scripts/decode_preencoded_samples.py`, `scripts/make_listening_page.py`, `scripts/check_streamgen_alignment.py` |
 | **Silence / level filtering at pre-encode** | `scripts/pre_encode_dataset.py --silence_threshold_db / --max_silence_fraction`, `stable_audio_3/data/utils.py` (`is_silent`, `silence_fraction`), `experiments/01-streamgen-conditioning/04-silence-filtering.md` |
 | **DiT / CFG in forward** | `stable_audio_3/models/dit.py` (`cfg_scale`, `apg_scale`, `scale_phi`, `cfg_interval`, …) |
