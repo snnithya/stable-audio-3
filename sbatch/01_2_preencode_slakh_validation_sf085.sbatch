@@ -4,9 +4,9 @@
 #SBATCH --qos=hai-res-main
 #SBATCH --account=hai-res
 #SBATCH --gres=gpu:l40s:1
-#SBATCH --cpus-per-task=16
+#SBATCH --cpus-per-task=32
 #SBATCH --mem=96G
-#SBATCH --time=02:00:00
+#SBATCH --time=04:00:00
 #SBATCH --output=/data/scratch-fast/snnithya/sao-3/logs/01_2_preencode_validation_sf085_%j.out
 #SBATCH --error=/data/scratch-fast/snnithya/sao-3/logs/01_2_preencode_validation_sf085_%j.err
 
