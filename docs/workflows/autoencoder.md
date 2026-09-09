@@ -178,8 +178,13 @@ with a player and a mel spectrogram per file:
 uv run python scripts/make_listening_page.py --dir ./latents_out/_sanity_check
 ```
 
-It writes `index.html` and `_mels/*.png` into that directory, referencing the wavs in
-place — open it directly, or `python -m http.server -d <dir> 8000` when working over SSH.
+It writes a single self-contained `index.html` into that directory: the spectrograms are
+inlined as data URIs and the audio as 24-bit FLAC (lossless, roughly a sixth of the
+float32 wavs), so it opens over `file://` with no server, and scp'ing that one file to
+your laptop takes the whole page with it. `--embed mp3` shrinks a large directory
+further, but it is lossy — not what you want for an autoencoder A/B; `--embed none`
+falls back to referencing the wavs and `_mels/*.png` in place, which needs
+`python -m http.server -d <dir> 8000` to view.
 Each sample becomes one card with its source stacked above its reconstruction (controls
 below), all spectrograms plotted on a single page-wide dB range so level and bandwidth
 differences are visible rather than normalized away. Click a spectrogram to seek and

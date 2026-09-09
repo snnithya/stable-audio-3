@@ -1,7 +1,10 @@
 # 1.5 — Silence filtering at pre-encode time
 
-**Status:** implemented; Slakh re-encoded with the filter on — validation done, train running
-**Date:** 2026-09-02 (filtered Slakh encode 2026-09-08)
+**Status:** implemented; both Slakh splits encoded at RMS + fraction 0.3, and both being
+re-encoded RMS-only into the other root (train done, validation in flight 2026-09-09). The
+cutoff is still the one read off BabySlakh — the RMS-only encodes are the census that should
+set it, and the bands are now decoded for a listening pass.
+**Date:** 2026-09-02 (filtered Slakh encode 2026-09-08; census + band listening 2026-09-09)
 
 ## Question
 
@@ -208,14 +211,60 @@ The survivors confirm the filter is cutting into the distribution rather than tr
 tail: max target `silence_fraction` 0.297 and max control 0.296 against the 0.30 cutoff, with
 medians at 0.17. The kept set is pressed right up against the threshold.
 
-### Train split
+### Train split: 252 and 240 items, from 1289 tracks
 
-Job 1766290, 4×L40S, 1289 files × 2 variants, launched 2026-09-08T17:49 and **still running**
-at the time of writing (job 1766197 was the same submission with the flag misspelled as
-`--silence_fraction`; it died in argparse in 77 s, which is the cheap failure mode this
-script's flag surface is meant to give). No per-variant counts yet — read them from
-`train/_skipped.json` when it lands. If the validation rate carries over, expect on the order
-of 250-300 items per variant out of 1289.
+Job 1766290, 4×L40S, 1289 files × 2 variants, completed 2026-09-08T18:16 (job 1766197 was the
+same submission with the flag misspelled as `--silence_fraction`; it died in argparse in 77 s,
+which is the cheap failure mode this script's flag surface is meant to give). From
+`train/_skipped.json`:
+
+| First failing check | v0 | v1 |
+|---|---|---|
+| target over the silence-fraction limit | 491 | 495 |
+| peak below silence threshold | 269 | 269 |
+| target below the RMS floor | 158 | 174 |
+| `streamgen_audio` over the silence-fraction limit | 105 | 95 |
+| accompaniment silent over the encoded window | 14 | 14 |
+| `streamgen_audio` below the RMS floor | — | 2 |
+| **written** | **252** | **240** |
+
+492 latents across the two variants out of 2578 attempts — 19%, in line with validation's 21%,
+and the "expect 250-300 per variant" guess held.
+
+The v0/v1 differences are not measurement noise on the same items. v1 is the augmented pass, so
+a time-stretch of up to ±10% changes how much of the fixed 13.3 s window each track fills, and
+the stem submix is re-rolled per pass, which is what moves `streamgen_audio` from 105 to 95 and
+adds the 2 mixes that land under the RMS floor. The 269 peak rejections and the 14 accompaniment
+rejections are identical across variants because neither depends on the roll.
+
+### A second, RMS-only train encode overwrote the old root (job 1776023)
+
+Separately, at 2026-09-08T23:44, job 1776023 encoded the train split **again** with only the
+RMS floor — no `--max_silence_fraction` — into `slakh-streamgen-preencoded-same-s/train/`, the
+*old* root. That is what the committed `slakh_streamgen_train.json` and
+`sbatch/01_2_preencode_slakh.sbatch` still do: neither was repointed at the `-wo-silence` root
+nor given the cutoff, so **re-running the committed train recipe does not reproduce the encode
+described above**. Fix that before anything else re-encodes train.
+
+Two consequences, both checked on disk rather than inferred:
+
+- **The duplicate-contaminated train encode no longer exists.** That directory now holds 1678
+  items (848 + 830), every file written between 23:23 and 23:44, with nothing surviving from the
+  Sep 2 pass. The 20%-duplicates problem is gone from train — but by silent overwrite, into a
+  path whose name still says nothing about which filter produced it.
+- **The duplicate-contaminated validation encode does still exist**, untouched since Sep 2: 270
+  items, and not one sidecar carries a `levels` block. That is the set 1.2 is scored on, and it
+  is the one that actually needed replacing.
+
+| Encode | Filter | v0 written | v1 written |
+|---|---|---|---|
+| `…-same-s-wo-silence/train` (job 1766290) | RMS -50 + fraction 0.3 | 252 | 240 |
+| `…-same-s-wo-silence/validation` (job 1766413) | RMS -50 + fraction 0.3 | 56 | — |
+| `…-same-s/train` (job 1776023) | RMS -50 only | 848 | 830 |
+| `…-same-s/validation` (Sep 2) | peak only, **20% duplicates** | 270 | — |
+
+The RMS-only train encode is an accident worth keeping: it is most of the level census this
+experiment recommended and never ran.
 
 ### Consequences for 1.2
 
@@ -232,6 +281,187 @@ of 250-300 items per variant out of 1289.
   validation, which against 144-frame latents would have silence-padded every item rather
   than cropping it). `scripts/eval_streamgen.py --eval_frames` still defaults to 256, which
   against a 144-frame item silently returns the whole item; pass `--eval_frames 144`.
+
+## The no-filter level census (staged 2026-09-09, not yet submitted)
+
+`--max_silence_fraction 0.3` was taken from 17 BabySlakh tracks. It is now the single biggest
+influence on what both splits contain, and it has never been checked against Slakh's own
+distribution. This is the pass that checks it.
+
+### Why a filtered pass cannot choose its own threshold
+
+Levels are computed for every item the level check sees, but the sidecar JSON is only written
+for items that **survive** (`pre_encode_dataset.py:478`). So the 56 written validation items
+all sit below 0.30 by construction — max target `silence_fraction` 0.297, max control 0.296 —
+and carry no information about the 214 that went. The distribution is truncated exactly at the
+knob it would be used to set. `--no_silence_filter` removes the truncation: nothing is dropped
+by the level check, so every item that reaches it gets a sidecar.
+
+`--no_silence_filter` switches off **only** that check. The two upstream gates still drop items
+with no sidecar and no recorded levels:
+
+- `is_silence` in `dataset.py` — peak below -60 dBFS over the whole crop (55 validation items).
+- The metadata fn's own per-stem RMS test — `accompaniment silent over the encoded window` (2).
+
+So expect **≈213 sidecars from 270 tracks**. Neither omission biases the choice of cutoff:
+both buckets hold items that no cutoff would have kept.
+
+### What the accidental train census already says
+
+Job 1776023 (RMS floor only, no fraction limit) left 848 v0 sidecars with `levels` blocks, so
+the train distribution can be read right now with no GPU time at all:
+
+| Stream | `silence_fraction` p05 / p25 / **median** / p75 / p95 |
+|---|---|
+| target | 0.074 / 0.207 / **0.346** / 0.571 / 0.857 |
+| `streamgen_audio` | 0.012 / 0.168 / **0.288** / 0.433 / 0.776 |
+
+**The cutoff sits below the target median.** BabySlakh's 17 tracks gave a target median of 0.30
+and Slakh's 848 give 0.346, so `--max_silence_fraction 0.3` rejects more than half the corpus on
+the target stream alone before the control is even looked at. That is the calibration error, and
+it is what the 19-21% keep rate is.
+
+Survivors at each candidate cutoff, RMS floor held at -50 dBFS (target **and** control must
+clear it), out of 848 censused / 1289 in the corpus:
+
+| cutoff | 0.1 | 0.2 | **0.3** | 0.4 | 0.5 | 0.6 | 0.7 | 0.8 | 0.9 | 1.0 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| items | 25 | 123 | **254** | 386 | 514 | 601 | 678 | 757 | 807 | 848 |
+| % of corpus | 2% | 10% | **20%** | 30% | 40% | 47% | 53% | 59% | 63% | 66% |
+
+Two things to read off it. There is no plateau — no natural cutoff where the curve flattens and
+the choice stops mattering — so this number has to be argued for on musical grounds, not found
+in the data. And 0.5 roughly doubles the held-out set for the price of admitting windows that
+are half silent, which on a 13.3 s window is a phrase with a ~6.6 s break in it.
+
+Two limits on this census, both real:
+
+- **It is truncated at -50 dBFS**, because the pass that produced it still applied the RMS
+  floor. The floor sweep is consequently flat from -70 to -50 and cannot say what the floor
+  costs. Only a genuine `--no_silence_filter` pass can.
+- **It is train, not validation.** The held-out split is the one whose size drives 1.2's
+  statistical power, and validation ran 21% against train's 19% at the same settings — close,
+  but not a substitute.
+
+Replaying the filter over this census predicts 254 written / 491 target-fraction /
+103 control-fraction against the filtered run's actual 252 / 491 / 105. The 2-item gap is the
+stem submix being re-rolled per pass: target-side numbers reproduce exactly, control-side
+numbers only to within the roll.
+
+### Listening to the bands (2026-09-09)
+
+There is no plateau, so the cutoff cannot be read off the survivor curve — it has to answer a
+musical question: at what point is a window too empty to be a useful training pair?
+`scripts/sample_silence_buckets.py` decodes two items from each 0.1-wide `silence_fraction`
+band, target and control, and annotates every card with the band and the measured levels, so
+the question can be answered by ear. Picks are spread across each band by `silence_fraction`
+(for `-n 2`, roughly its 25th and 75th percentile) rather than drawn at random, so the two
+clips bracket the band instead of landing next to each other; there is no seed.
+
+Run over the RMS-only train encode (848 v0 items), which is the only set on disk that has the
+upper bands at all:
+
+| target `silence_fraction` | 0.0-0.1 | 0.1-0.2 | **0.2-0.3** | 0.3-0.4 | 0.4-0.5 | 0.5-0.6 | 0.6-0.7 | 0.7-0.8 | 0.8-0.9 | 0.9-1.0 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| items | 55 | 149 | **153** | 132 | 93 | 81 | 55 | 65 | 35 | 30 |
+
+The distribution is unimodal with its **mode at 0.2-0.3**, which means 0.3 is the worst place
+to put the threshold if stability matters: it slices at the peak, where the derivative of the
+survivor count is highest (~130 items per 0.1 of cutoff around 0.3, against ~65 around 0.7).
+Any small change to the window length, the augmentation roll, or the corpus moves a large
+number of items across it. That is an argument for choosing a cutoff off the mode independent
+of what the clips sound like.
+
+Output: `…/data/_listening/silence_bands_train_v0/` — 40 wavs, 20 cards, `index.html` 16.8 MB
+self-contained (mp3-embedded; flac would be ~6× that for no audible gain on this question).
+The cards show the decode of the stored latent and of the stored control, which is what the
+model trains on; there is no source row, so use `scripts/decode_preencoded_samples.py` for a
+source/decoded A/B.
+
+### Files
+
+| File | What it is |
+|---|---|
+| `sbatch/01_2_preencode_slakh_validation_nofilter.sbatch` | The job. Same encode as the filtered validation job, `--no_silence_filter` in place of `--max_silence_fraction 0.3`, then runs the analysis so the numbers land in the job log. |
+| `…/dataset2preencoding/slakh_streamgen_validation_nofilter.json` | Config. Mirrors `slakh_streamgen_validation.json` — same source tree, same metadata module, same control, same `augment_seed` — differing only in `output_path`, `no_silence_filter`, `augment_variants: 1`, `sanity_check_samples: 0`. |
+| `scripts/analyze_silence_levels.py` | Reads `levels` out of any pre-encode output: per-stream quantiles, a survivor sweep over both knobs, the RMS/fraction overlap table, and the `_skipped.json` buckets the settings would produce. Warns loudly when pointed at a filtered pass, and reports coverage from `_skipped.json` so percentages are of the corpus, not of the sidecars that happen to exist. |
+| `scripts/sample_silence_buckets.py` | Decodes N items per `silence_fraction` band into a directory `make_listening_page.py` can render, each card labelled with its band and levels. For choosing the cutoff by ear. |
+
+Output goes to a **separate root**, `slakh-streamgen-nofilter-census-same-s/validation/`, so
+neither existing validation encode is touched. It is diagnostic: ~213 items, ~65 MB, and
+nothing should train or score on it. One GPU, not the two the filtered job asked for —
+`pre_encode_dataset.py` runs one autoencoder on one device, so the second was idle.
+
+### Plan change 2026-09-09: validation re-encoded RMS-only, which is the census
+
+The Sep 2 duplicate-contaminated `same-s/validation` was deleted and
+`slakh_streamgen_validation.json` repointed at that path with `--max_silence_fraction` dropped
+from `01_2_preencode_slakh_validation.sbatch`, so validation is being re-encoded RMS-only —
+exactly what job 1776023 did to train. This is the right order of operations: it fixes the
+contaminated held-out set first, and the resulting encode **is** the validation level census,
+because an RMS-only pass writes a sidecar for every item the fraction limit would have dropped.
+Expect ~177 items (270 − 55 peak − 36 target RMS − 2 accompaniment), spanning the whole
+`silence_fraction` range.
+
+After it lands the two roots are a clean matched pair, which they were not before:
+
+| Root | Filter | train | validation |
+|---|---|---|---|
+| `slakh-streamgen-preencoded-same-s` | RMS -50 only | 848 / 830 | ~177 (encoding) |
+| `slakh-streamgen-preencoded-same-s-wo-silence` | RMS -50 + fraction 0.3 | 252 / 240 | 56 |
+
+That makes the dedicated `--no_silence_filter` job **largely redundant**. Its one remaining use
+is the RMS floor itself: an RMS-only pass cannot record levels for the items it drops, so the
+floor sweep stays flat from -70 to -50 and the -50 default is still unexamined. Run the census
+job only to interrogate the floor; the fraction cutoff can be chosen from the RMS-only encodes.
+
+**Open, and it bites a training run silently:** the preencoded configs are currently a mismatched
+pair — `slakh_streamgen_train_preencoded.json` points at `same-s/train` (RMS-only) while
+`slakh_streamgen_validation_preencoded.json` still points at `-wo-silence/validation` (RMS +
+0.3). A run right now trains on one distribution and scores on a strictly denser subset of
+another. Repoint validation at `same-s/validation` once the encode lands, or repoint train at
+`-wo-silence/train` — either, but not one of each.
+
+### Decided: `--max_silence_fraction 0.85` (2026-09-09)
+
+Chosen by listening to the band page above, not from the survivor curve — the curve has no
+plateau, so there was nothing in the data to pick the number out of. **0.85 for Slakh at the
+13.3 s window.**
+
+What it keeps, from the train v0 census (848 items, RMS floor already applied):
+
+| cutoff | 0.75 | 0.80 | **0.85** | 0.90 | 0.95 | off |
+|---|---|---|---|---|---|---|
+| items kept (both streams) | 704 | 757 | **784** | 807 | 834 | 848 |
+| % of the 1289 corpus | 55% | 59% | **61%** | 63% | 65% | 66% |
+
+At 0.85 the fraction limit stops being the dominant knob and becomes a **backstop**: it keeps
+92% of what clears the RMS floor, and what it removes is windows with under about 2 s of content
+in 13.3 s. That is exactly the case the RMS floor is blind to — 99.9% silence with one full-scale
+hit measures about -31 dBFS and clears any sane floor — so the two checks now divide the work the
+way the write-up above argued they should. Neither is being asked to judge whether sparse-but-real
+drumming is worth training on, which is the judgement 0.3 was silently making.
+
+Three reasons to prefer it to 0.3 beyond the listening:
+
+- **0.3 was below the corpus median** (target median 0.346). It rejected more than half the
+  corpus on the target stream before the control was even looked at.
+- **0.3 sat on the mode** of the distribution (the 0.2-0.3 band holds 153 of 848 items), the
+  point of maximum sensitivity: ~130 items cross the line per 0.1 of cutoff there, against ~40
+  per 0.1 at 0.85. The threshold is now stable against changes in window length, augmentation
+  roll, or corpus.
+- **It buys back most of 1.2's statistical power.** The held-out split goes from 56 to an
+  expected ~160-165 of 270, so the paired per-item comparison is ≈1.7× tighter than at 0.3 and
+  only ≈1.3× noisier than the full 270, against 2.2× at 0.3.
+
+Nothing on disk uses 0.85 yet. Both splits need re-encoding with it, into a root whose **name
+states the cutoff** (`…-same-s-sf085/`) — this dataset family has been silently redefined twice
+already. Inventory and naming convention: [docs/data/slakh-streamgen.md](../../docs/data/slakh-streamgen.md).
+
+The alternative not taken: encoding at a longer window, where 30% of 380 s is a genuinely dead
+track and the original config comments' intuition would have held. That remains the better fix
+if the 13.3 s window is ever revisited for other reasons; it was not worth re-encoding for on
+its own.
 
 ## What this means for 1.2
 
@@ -257,6 +487,27 @@ pass with the filter off. See [The first filtered encode of Slakh](#the-first-fi
 above: it keeps 56 of 270 validation tracks, so the knob is now the dominant influence on
 what the held-out set contains and is the first thing to revisit if 1.2 comes out
 underpowered.
+
+**Reopened and re-resolved 2026-09-09** — 0.3 was the BabySlakh number and the accidental
+RMS-only train encode showed it sitting *below* Slakh's own target median (0.346) and on the mode
+of the distribution, which is why both splits kept only about a fifth of their tracks. Bands were
+decoded and listened to, and the cutoff is now **0.85**; see
+[Decided: --max_silence_fraction 0.85](#decided---max_silence_fraction-085-2026-09-09).
+
+Still open, and both block reading any 1.2 result:
+
+1. **Neither split is encoded at 0.85 yet.** Re-encode both, same cutoff, into a root whose name
+   states it.
+2. **The validation encode 1.2 would score on is the Sep 2, duplicate-contaminated one** — or
+   rather it no longer exists, having been deleted 2026-09-09 pending re-encode. Train was
+   replaced twice, into two different roots; validation never was. The
+   `preencoded/` configs are correspondingly a mismatched pair (train RMS-only, validation
+   fraction 0.3), so a run today trains on one distribution and scores on a denser subset of
+   another.
+
+Dataset inventory, filter settings, naming convention and the config table now live in
+[docs/data/slakh-streamgen.md](../../docs/data/slakh-streamgen.md) rather than being scattered
+through this write-up.
 
 ## Notes
 
@@ -299,6 +550,29 @@ uv run python scripts/check_streamgen_alignment.py --config <preencoded config> 
 # What the 2026-09-08 filtered Slakh encode kept, and why the rest went
 SLAKH=/data/hai-res/shared/snnithya/sao-3/data/slakh-streamgen-preencoded-same-s-wo-silence
 cat $SLAKH/validation/_skipped.json
-cat $SLAKH/train/_skipped.json      # written when the train job finishes
+cat $SLAKH/train/_skipped.json
 ls $SLAKH/validation/*[0-9].npy | wc -l
+
+# Read the level distribution and the survivor sweep off any encode. Point it at the RMS-only
+# train encode for numbers available right now (it warns that the pass was filtered, which is
+# the point -- the sweep is truncated at -50 dBFS):
+uv run python scripts/analyze_silence_levels.py \
+  --dir /data/hai-res/shared/snnithya/sao-3/data/slakh-streamgen-preencoded-same-s/train \
+  --variant v0
+
+# The staged census. Nothing has been submitted; this is the whole run.
+sbatch sbatch/01_2_preencode_slakh_validation_nofilter.sbatch
+CENSUS=/data/hai-res/shared/snnithya/sao-3/data/slakh-streamgen-nofilter-census-same-s/validation
+uv run python scripts/analyze_silence_levels.py --dir $CENSUS   # the sbatch also does this
+ls $CENSUS/[0-9]*.json | wc -l                                  # expect ~213 of 270
+
+# Choose the cutoff by ear: two items per 0.1-wide silence_fraction band, target + control,
+# every card labelled with its band and levels. Needs an encode that HAS the upper bands,
+# i.e. RMS-only or no-filter -- not one already cut at 0.3.
+BANDS=/data/hai-res/shared/snnithya/sao-3/data/_listening/silence_bands_train_v0
+uv run python scripts/sample_silence_buckets.py \
+  --dir /data/hai-res/shared/snnithya/sao-3/data/slakh-streamgen-preencoded-same-s/train \
+  --variant v0 --model same-s -n 2 --controls streamgen_audio --out $BANDS
+uv run python scripts/make_listening_page.py --dir $BANDS --embed mp3
+# then open $BANDS/index.html, or scp just that one file
 ```

@@ -1,0 +1,19 @@
+{
+    "dataset_type": "audio_dir",
+    "output_path": "/data/hai-res/shared/snnithya/sao-3/data/slakh-streamgen-nofilter-census-same-s/validation/",
+    "datasets": [
+        {
+            "id": "slakh-streamgen-validation",
+            "path": "/data/hai-res/shared/snnithya/sat-zenon-data/slakh2100/streamgen-drum-mirror/validation/tracks/drums",
+            "custom_metadata_module": "stable_audio_3/configs/dataset_configs/custom_metadata/custom_md_slakh_streamgen.py"
+        }
+    ],
+    "controls": [
+        "streamgen_audio"
+    ],
+    "no_silence_filter": true,
+    "augment_variants": 1,
+    "augment_seed": 42,
+    "sanity_check_samples": 0,
+    "_comment": "DIAGNOSTIC ONLY -- DO NOT TRAIN OR SCORE ON THIS ENCODE. It is a level census of the Slakh2100 validation split, written with 'no_silence_filter' so that every item that reaches the level check gets a sidecar JSON with its 'levels' block. That is the point: the pre-encode script records levels on every item but only writes the sidecar for items that SURVIVE (pre_encode_dataset.py:478), so a pass with the filter on yields a distribution truncated at its own thresholds and cannot be used to choose them. This is the 'run once with the filter off, then pick a cutoff' pass that the 2026-09-08 encode skipped in favour of the BabySlakh distribution. Read it with scripts/analyze_silence_levels.py, then set --max_silence_fraction / --silence_threshold_db on the real encode. Mirrors slakh_streamgen_validation.json exactly except for the four keys above -- same source tree, same custom metadata module, same control, same augment_seed 42 -- because the census only transfers to the real encode if the window and the submix rolls are the same. It is NOT a superset of the real encode: 'no_silence_filter' switches off the level check in pre_encode_dataset.py and nothing else, so the two upstream gates still drop items unrecorded -- is_silence in dataset.py (peak below -60 dBFS over the whole crop, 55 validation items on the 2026-09-08 run) and the metadata fn's own per-stem RMS test (accompaniment silent over the encoded window, 2 items). Expect roughly 270 - 57 = 213 sidecars. Neither omission biases the cutoff choice: both buckets are items no cutoff would have kept anyway. Window: pass --sample_size 587853 --pad --batch_size 8 on the CLI, never as keys here (merge_config_into_args treats any argparse default that is not None as CLI-supplied, so a 'sample_size' key is silently ignored), and it must match whatever the real encode uses -- a silence_fraction cutoff read at 13.3s means something quite different at 380s. augment_variants is 1 and sanity_check_samples is 0 because a census needs neither: variant 0 is the unaugmented pass, which is what the level filter should be calibrated on, and the decoded wavs are listening material, not data. See experiments/01-streamgen-conditioning/04-silence-filtering.md."
+}

@@ -1,6 +1,6 @@
 {
     "dataset_type": "audio_dir",
-    "output_path": "/data/hai-res/shared/snnithya/sao-3/data/slakh-streamgen-preencoded-same-s-wo-silence/validation/",
+    "output_path": "/data/hai-res/shared/snnithya/sao-3/data/slakh-streamgen-preencoded-same-s/validation/",
     "datasets": [
         {
             "id": "slakh-streamgen-validation",
