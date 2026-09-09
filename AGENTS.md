@@ -6,6 +6,28 @@ This repo extends [Stable Audio 3](https://github.com/Stability-AI/stable-audio-
 
 ---
 
+## Branch & worktree policy (agents)
+
+**Never work in the main checkout** (`/data/hai-res/snnithya/stable-audio-3`). Nithya edits and runs jobs there on `v/r` at the same time you are working; switching branches or writing files there would clobber that.
+
+One task = one branch = one worktree. At the start of a task, from the main checkout:
+
+```bash
+scripts/new_worktree.sh <task-name>     # branch claude/<task-name>, worktree in ../sa3-wt/<task-name>
+```
+
+Then work only inside that worktree, commit there, and stop — Nithya reviews and merges (`git diff v/r...claude/<task-name>`). Do not merge into `v/r` or push unless asked.
+
+**Running code in a worktree.** The shared `.venv` has an editable install whose path is hardcoded to the main checkout, so:
+
+- Use `$SA3_PY` (set by the worktree's `.claude/settings.local.json`), e.g. `$SA3_PY -m pytest tests/...`.
+- `PYTHONPATH` is pinned to the worktree root, which is what makes `import stable_audio_3` resolve to *your* code. Without it, `$SA3_PY scripts/foo.py` silently imports the main checkout's source instead.
+- **Do not run `uv run` or `uv sync` from a worktree.** They would either build a second 4.4G venv or repoint the shared editable install at the worktree and break the main checkout. (The `uv run` guidance under Environment applies to the main checkout only.)
+- Anything that shells out to `python` — sbatch scripts in particular — may still resolve to the main checkout, since `sbatch/*.sbatch` hardcode `REPO=`. Don't submit jobs from a worktree without checking that first.
+
+Your branch is based on the last *commit* on `v/r`; uncommitted work in the main checkout is invisible to you. If a change Nithya mentions seems missing, ask rather than reimplementing it.
+
+
 ## Project goals (edit as scope evolves)
 
 | Area | Intent |
