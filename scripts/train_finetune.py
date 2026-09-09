@@ -93,6 +93,14 @@ def load_model(model_name: str, device: torch.device, model_config_path: str = N
     model = create_diffusion_cond_from_config(model_config)
     copy_state_dict(model, load_file(local_ckpt))
     model.to(device=device, dtype=torch.bfloat16)
+    # Keep the autoencoder in fp32. Training runs on pre-encoded latents, so the
+    # pretransform is only ever used to decode demo audio -- and bf16 costs it ~11 dB of
+    # SNR above 10 kHz (measured, same-s: 30.8 dB fp32 vs 19.4 dB bf16), which is audible
+    # as grain on the wandb clips and is then amplified by save_demo_wavs' peak
+    # normalisation. The weight-norm reparametrisation is what loses the precision: fp32
+    # weights under autocast score 30.3 dB, so it is the stored dtype, not the compute.
+    if model.pretransform is not None:
+        model.pretransform.to(torch.float32)
     return model, model_config
 
 

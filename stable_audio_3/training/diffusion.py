@@ -1110,8 +1110,14 @@ class DiffusionCondInpaintDemoCallback(pl.Callback):
         target_paths, prefix_paths, streamgen_paths = [], [], []
         if log_rows:
             pretransform = module.diffusion.pretransform
-            with torch.amp.autocast("cuda"):
-                unique_reals = demo_reals[unique_rows]
+            # Decode the references at the pretransform's own precision, with autocast off
+            # when that is fp32. demo_reals was cast to the DiT's dtype above, and handing
+            # bf16 latents to the autoencoder costs ~9 dB of SNR above 10 kHz -- audible
+            # grain on exactly the clips the generations are judged against. A bf16
+            # pretransform keeps the old autocast path, so nothing regresses there.
+            pt_dtype = next(pretransform.parameters()).dtype if pretransform is not None else demo_reals.dtype
+            with torch.amp.autocast("cuda", enabled=pt_dtype != torch.float32):
+                unique_reals = demo_reals[unique_rows].to(pt_dtype)
                 target_decoded = pretransform.decode(unique_reals) if pretransform is not None else unique_reals
                 target_paths = save_demo_wavs(
                     target_decoded, 'demo_target', trainer.global_step,
@@ -1119,7 +1125,7 @@ class DiffusionCondInpaintDemoCallback(pl.Callback):
                 )
                 del target_decoded, unique_reals
 
-                unique_masked = masked_input[unique_rows]
+                unique_masked = masked_input[unique_rows].to(pt_dtype)
                 prefix_decoded = pretransform.decode(unique_masked) if pretransform is not None else unique_masked
                 prefix_paths = save_demo_wavs(
                     prefix_decoded, 'demo_inpaint_prefix', trainer.global_step,
@@ -1131,7 +1137,7 @@ class DiffusionCondInpaintDemoCallback(pl.Callback):
                     # Already gated by tf_mask in _add_streamgen_conditioning, so this is
                     # exactly what the model sees, silence beyond the lookahead included.
                     # It differs per tf value, so unlike the target it stays per row.
-                    streamgen_latent = conditioning['streamgen_latent'][0]
+                    streamgen_latent = conditioning['streamgen_latent'][0].to(pt_dtype)
                     streamgen_decoded = pretransform.decode(streamgen_latent) if pretransform is not None else streamgen_latent
                     streamgen_paths = save_demo_wavs(
                         streamgen_decoded, 'demo_streamgen', trainer.global_step,

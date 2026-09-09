@@ -11,29 +11,39 @@ stays with the id: n logged samples across N variants give n x N cards, each sho
 pitch/tempo roll it was written with. Grouping the variants together instead would stack
 four unrelated renderings of a track on one card and break the source/decoded pairing.
 
-The page is plain HTML referencing the wavs in place, so open it from the same
-directory (file:// works; over SSH, `python -m http.server` in that directory).
+The page is self-contained: the mel images and the audio are inlined as data URIs, so
+index.html is one file that opens over file:// — on the machine that wrote it, or after
+scp'ing that single file to your laptop — with no server to start. Audio is inlined as
+24-bit FLAC, which is lossless to the ear and about a sixth of the float32 wavs; use
+`--embed mp3` if a directory is too big for that (lossy: not for autoencoder A/B), or
+`--embed none` for the old behaviour of referencing the wavs in place, which needs
+`python -m http.server` in the directory to view.
 
 Usage:
   uv run python scripts/make_listening_page.py --dir /path/to/_sanity_check
 """
 
 import argparse
+import base64
 import html
+import io
 import json
 import math
 import re
 from pathlib import Path
 
 import matplotlib
+import soundfile
 import torch
 import torchaudio
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
-# Order streams source-first so the ground truth sits above its reconstruction.
-STREAM_ORDER = ["source", "decoded"]
+# Order streams source-first so the ground truth sits above its reconstruction. The
+# autoencoder names are here for compare_autoencoders.py, which writes one row per model;
+# alphabetical order would put same-l above same-s and invert the small-to-large reading.
+STREAM_ORDER = ["source", "same-s", "same-l", "decoded"]
 
 # `<id>` or `<id>_v<n>`, followed by the stream label. The non-greedy first branch is what
 # keeps an augmentation-variant suffix on the id side of the split; the second is the
@@ -72,6 +82,33 @@ def mel_db(path, n_mels, max_width):
     return db.numpy(), audio.shape[-1] / sr
 
 
+AUDIO_MIME = {"flac": "audio/flac", "mp3": "audio/mpeg", "wav": "audio/wav"}
+
+
+def encode_audio(path, codec):
+    """Re-encode a wav into bytes to inline in the page.
+
+    FLAC at 24 bit is what makes a self-contained page a sane size — around a sixth of
+    the float32 wav, with nothing audible given up, so a source/decoded A/B still shows
+    only the autoencoder's own artifacts. mp3 is for directories too large for that; it
+    is lossy and will colour that comparison. Samples above full scale are clipped
+    rather than wrapped, so an overshooting decode reads as clipping.
+    """
+    audio, sr = soundfile.read(str(path), dtype="float32", always_2d=True)
+    buf = io.BytesIO()
+    if codec == "flac":
+        soundfile.write(buf, audio.clip(-1.0, 1.0), sr, format="FLAC", subtype="PCM_24")
+    elif codec == "mp3":
+        soundfile.write(buf, audio, sr, format="MP3")
+    else:
+        soundfile.write(buf, audio, sr, format="WAV", subtype="FLOAT")
+    return buf.getvalue()
+
+
+def data_uri(mime, payload):
+    return f"data:{mime};base64,{base64.b64encode(payload).decode('ascii')}"
+
+
 def load_metadata(wav_dir, sample_id):
     """Metadata json written by pre_encode_dataset.py, if it sits next to the wavs."""
     for candidate in (wav_dir / f"{sample_id}.json", wav_dir.parent / f"{sample_id}.json"):
@@ -87,8 +124,10 @@ def build(args):
     if not wavs:
         raise SystemExit(f"No .wav files in {wav_dir}")
 
+    embed = args.embed != "none"
     mel_dir = wav_dir / "_mels"
-    mel_dir.mkdir(exist_ok=True)
+    if not embed:
+        mel_dir.mkdir(exist_ok=True)
 
     print(f"Computing {len(wavs)} mel spectrograms…")
     specs = {}
@@ -102,9 +141,26 @@ def build(args):
     vmax = max(float(db.max()) for db, _ in specs.values())
     vmin = vmax - args.dynamic_range
 
+    mel_src = {}
     for wav in wavs:
         db, _ = specs[wav.name]
-        plt.imsave(mel_dir / f"{wav.stem}.png", db, cmap="magma", origin="lower", vmin=vmin, vmax=vmax)
+        if embed:
+            buf = io.BytesIO()
+            plt.imsave(buf, db, cmap="magma", origin="lower", vmin=vmin, vmax=vmax, format="png")
+            mel_src[wav.name] = data_uri("image/png", buf.getvalue())
+        else:
+            plt.imsave(mel_dir / f"{wav.stem}.png", db, cmap="magma", origin="lower", vmin=vmin, vmax=vmax)
+            mel_src[wav.name] = f"_mels/{html.escape(wav.stem)}.png"
+
+    audio_src = {}
+    if embed:
+        print(f"Inlining {len(wavs)} clips as {args.embed}…")
+        for wav in wavs:
+            payload = encode_audio(wav, args.embed)
+            audio_src[wav.name] = data_uri(AUDIO_MIME[args.embed], payload)
+            print(f"  {wav.name}  {wav.stat().st_size / 1e6:.1f} MB -> {len(payload) / 1e6:.1f} MB")
+    else:
+        audio_src = {wav.name: html.escape(wav.name) for wav in wavs}
 
     groups = {}
     for wav in wavs:
@@ -121,6 +177,10 @@ def build(args):
             meta_bits.append(f"src: {md['path']}")
         if md.get("seconds_total"):
             meta_bits.append(f"{md['seconds_total']}s total")
+        if md.get("start_seconds") is not None:
+            meta_bits.append(f"@{md['start_seconds']}s +{md.get('seconds', '?')}s")
+        if md.get("rms_dbfs") is not None:
+            meta_bits.append(f"{md['rms_dbfs']} dBFS")
         aug = md.get("augmentation")
         if aug:
             # Written per item by pre_encode_dataset.py, so the card says which roll it is
@@ -131,14 +191,18 @@ def build(args):
             )
         meta = html.escape(" · ".join(meta_bits))
 
+        streams = md.get("streams", {})
+
         rows = []
         for label, wav in sorted(items, key=lambda it: stream_sort_key(it[0])):
             duration = specs[wav.name][1]
+            note = streams.get(label)
+            note_html = f'<span class="note">{html.escape(note)}</span>' if note else ""
             rows.append(f"""
       <div class="row" data-duration="{duration:.4f}">
-        <div class="label">{html.escape(label)}<span class="dur">{duration:.1f}s</span></div>
-        <audio preload="none" controls src="{html.escape(wav.name)}"></audio>
-        <div class="spec"><img src="_mels/{html.escape(wav.stem)}.png" alt="mel spectrogram">
+        <div class="label">{html.escape(label)}<span class="dur">{duration:.1f}s</span>{note_html}</div>
+        <audio preload="none" controls src="{audio_src[wav.name]}"></audio>
+        <div class="spec"><img src="{mel_src[wav.name]}" alt="mel spectrogram">
           <div class="playhead"></div></div>
       </div>""")
 
@@ -160,8 +224,11 @@ def build(args):
 
     out = Path(args.out) if args.out else wav_dir / "index.html"
     out.write_text(page)
-    print(f"\nWrote {out.resolve()}")
-    print(f"Open it directly, or serve the directory:  python -m http.server -d {wav_dir.resolve()} 8000")
+    print(f"\nWrote {out.resolve()}  ({out.stat().st_size / 1e6:.1f} MB)")
+    if embed:
+        print("Self-contained: open it over file://, or scp just this one file and open it there.")
+    else:
+        print(f"References the wavs in place, so serve the directory:  python -m http.server -d {wav_dir.resolve()} 8000")
 
 
 PAGE = """<!doctype html>
@@ -191,12 +258,13 @@ PAGE = """<!doctype html>
   h2 {{ margin: 0 0 2px; font-size: 14px; font-family: ui-monospace, Menlo, monospace;
     color: var(--accent); font-weight: 600; }}
   .meta {{ margin: 0 0 12px; color: var(--dim); font-size: 12px; word-break: break-all; }}
-  .row {{ display: grid; grid-template-columns: 150px 260px 1fr; gap: 12px;
+  .row {{ display: grid; grid-template-columns: 210px 260px 1fr; gap: 12px;
     align-items: center; padding: 7px 0; border-top: 1px solid var(--line); }}
   .row:first-of-type {{ border-top: 0; }}
   .label {{ font-family: ui-monospace, Menlo, monospace; font-size: 12px;
     display: flex; flex-direction: column; }}
   .dur {{ color: var(--dim); font-size: 11px; }}
+  .note {{ color: var(--dim); font-size: 10.5px; line-height: 1.35; margin-top: 2px; }}
   audio {{ width: 100%; height: 34px; }}
   .spec {{ position: relative; height: 74px; border-radius: 5px; overflow: hidden;
     background: #000; cursor: pointer; }}
@@ -275,4 +343,7 @@ if __name__ == "__main__":
     p.add_argument("--n_mels", type=int, default=128)
     p.add_argument("--max_width", type=int, default=2000, help="Max spectrogram width in frames")
     p.add_argument("--dynamic_range", type=float, default=80.0, help="dB below the page-wide peak to plot")
+    p.add_argument("--embed", choices=["flac", "mp3", "wav", "none"], default="flac",
+                   help="Inline the audio in the page (flac: lossless, ~1/6 the wav; mp3: lossy, smallest; "
+                        "wav: exact bytes, largest; none: reference the wavs in place and serve the directory)")
     build(p.parse_args())

@@ -71,6 +71,9 @@ def load_model(model_name: str, device: torch.device):
     model.to(device=device, dtype=torch.bfloat16).eval().requires_grad_(False)
     if model.pretransform is not None:
         model.pretransform.enable_grad = False
+        # fp32 autoencoder: bf16 costs it ~11 dB of SNR above 10 kHz, which shows up as
+        # grain on the demo audio. See the same note in train_finetune.py:load_model.
+        model.pretransform.to(torch.float32)
     return model, model_config
 
 

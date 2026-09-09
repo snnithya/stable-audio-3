@@ -214,7 +214,9 @@ See [Autoencoder Workflows](docs/workflows/autoencoder.md) for encoding batches,
 uv run python scripts/make_listening_page.py --dir ./latents_out/_sanity_check
 ```
 
-This writes an `index.html` next to the wavs, pairing each source with its reconstruction. See [Autoencoder Workflows](docs/workflows/autoencoder.md#sanity-checking-a-pre-encoded-dataset) for details.
+This writes a self-contained `index.html` next to the wavs — audio and spectrograms
+inlined, so it opens over `file://` with no server — pairing each source with its
+reconstruction. See [Autoencoder Workflows](docs/workflows/autoencoder.md#sanity-checking-a-pre-encoded-dataset) for details.
 
 ## CLI
 

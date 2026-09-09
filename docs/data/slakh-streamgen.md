@@ -70,6 +70,11 @@ empty accompaniment is a training pair whose lesson is that the control carries 
 --max_silence_fraction      0.85   <- chosen 2026-09-09, see below
 ```
 
+The cutoff lives in `slakh_streamgen_{train,validation}_sf085.json` as a `max_silence_fraction`
+key, and the sbatch scripts deliberately pass no such flag: a CLI flag always wins over a config
+value, so having both would mean two sources of truth and a silent override the next time one is
+edited. The encode prints its resolved filter at startup, so the job log still records what ran.
+
 `--silence_threshold_db -50` catches the realistic empty window — a dead stem, a noise floor, a
 track that has not started. It cannot catch a window that is 99.9% silence with one full-scale
 hit in it, which averages about -31 dBFS RMS and clears the floor comfortably. That blind spot
@@ -108,14 +113,24 @@ Train v0 census (848 items with `levels`, RMS floor already applied):
 |---|---|---|---|---|
 | `slakh-streamgen-preencoded-same-s` | RMS -50 only | 848 / 830 | *deleted 2026-09-09, re-encode pending* | train job 1776023, 2026-09-08 |
 | `slakh-streamgen-preencoded-same-s-wo-silence` | RMS -50 + fraction **0.3** | 252 / 240 | 56 | jobs 1766290 / 1766413, 2026-09-08 |
-| `slakh-streamgen-nofilter-census-same-s` | none (level gate off) | — | staged, not submitted | — |
+| `slakh-streamgen-preencoded-same-s-sf085` | RMS -50 + fraction **0.85** ← current | *not encoded* | *not encoded* | recipe written 2026-09-09, unrun |
 
 All under `/data/hai-res/shared/snnithya/sao-3/data/`, all `same-s`, all the 13.3 s window,
 train written with 2 augmentation variants and validation with 1.
 
 Nothing on disk uses the 0.85 cutoff yet. Expect **~784 / ~780 train** per variant and
 **~160-165 validation** (270 − 55 peak − 36 target RMS − 2 accompaniment = 177 RMS-survivors,
-of which ~92% clear 0.85 if train's ratio carries over).
+of which ~92% clear 0.85 if train's ratio carries over):
+
+```bash
+sbatch sbatch/01_2_preencode_slakh_train_sf085.sbatch
+sbatch sbatch/01_2_preencode_slakh_validation_sf085.sbatch
+```
+
+Both are one GPU and 2-4h, against the 2 and 4 GPUs and 12h/16h the 2026-09-08 jobs requested:
+`pre_encode_dataset.py` runs a single autoencoder on a single device, and those jobs took 3m45s
+(validation) and 27m (train) of their allocations. Each ends by printing `_skipped.json` and the
+level distribution into its own log.
 
 Two names to distrust. `-wo-silence` does not mean "silence removed" as against the other root
 removing none — both apply the RMS floor, and the only difference is the fraction limit. And
@@ -131,9 +146,10 @@ be audited from a config file, and this dataset family has now been silently red
 
 | Config | Points at |
 |---|---|
-| `dataset2preencoding/slakh_streamgen_train.json` | writes `…-same-s/train` (**no** fraction limit in `sbatch/01_2_preencode_slakh.sbatch`) |
-| `dataset2preencoding/slakh_streamgen_validation.json` | writes `…-same-s/validation` (**no** fraction limit in `sbatch/01_2_preencode_slakh_validation.sbatch`) |
-| `dataset2preencoding/slakh_streamgen_validation_nofilter.json` | writes `…-nofilter-census-same-s/validation`, diagnostic only |
+| `dataset2preencoding/slakh_streamgen_train_sf085.json` | **current recipe.** Writes `…-same-s-sf085/train` at fraction 0.85, 2 variants. `sbatch/01_2_preencode_slakh_train_sf085.sbatch` |
+| `dataset2preencoding/slakh_streamgen_validation_sf085.json` | **current recipe.** Writes `…-same-s-sf085/validation` at fraction 0.85, 1 variant. `sbatch/01_2_preencode_slakh_validation_sf085.sbatch` |
+| `dataset2preencoding/slakh_streamgen_train.json` | superseded. Writes `…-same-s/train` (**no** fraction limit in `sbatch/01_2_preencode_slakh.sbatch`) |
+| `dataset2preencoding/slakh_streamgen_validation.json` | superseded. Writes `…-same-s/validation` (**no** fraction limit in `sbatch/01_2_preencode_slakh_validation.sbatch`) |
 | `preencoded/slakh_streamgen_train_preencoded.json` | reads `…-same-s/train` |
 | `preencoded/slakh_streamgen_validation_preencoded.json` | reads `…-same-s-wo-silence/validation` |
 
@@ -149,9 +165,9 @@ silently returns the whole item; pass `--eval_frames 144`.
 ## Re-encoding
 
 ```bash
-# Both splits, same cutoff, or the two are not comparable.
-sbatch sbatch/01_2_preencode_slakh.sbatch                  # train, 2 variants
-sbatch sbatch/01_2_preencode_slakh_validation.sbatch       # validation, 1 variant
+# Both splits, same cutoff, or the two are not comparable. The cutoff is in the config.
+sbatch sbatch/01_2_preencode_slakh_train_sf085.sbatch        # train, 2 variants
+sbatch sbatch/01_2_preencode_slakh_validation_sf085.sbatch   # validation, 1 variant
 
 # What went and why, per variant, next to the latents.
 cat <root>/{train,validation}/_skipped.json
@@ -160,7 +176,7 @@ cat <root>/{train,validation}/_skipped.json
 uv run python scripts/analyze_silence_levels.py --dir <root>/train --variant v0
 
 # Two decoded items per silence band, for a listening pass. Needs an encode that HAS the
-# upper bands -- RMS-only or unfiltered, not one already cut.
+# upper bands, i.e. one written without a fraction limit -- not one already cut.
 uv run python scripts/sample_silence_buckets.py --dir <root>/train --variant v0 \
     --model same-s -n 2 --controls streamgen_audio --out <wavdir>
 uv run python scripts/make_listening_page.py --dir <wavdir> --embed mp3
