@@ -23,7 +23,10 @@ Then work only inside that worktree, commit there, and stop — Nithya reviews a
 - Use `$SA3_PY` (set by the worktree's `.claude/settings.local.json`), e.g. `$SA3_PY -m pytest tests/...`.
 - `PYTHONPATH` is pinned to the worktree root, which is what makes `import stable_audio_3` resolve to *your* code. Without it, `$SA3_PY scripts/foo.py` silently imports the main checkout's source instead.
 - **Do not run `uv run` or `uv sync` from a worktree.** They would either build a second 4.4G venv or repoint the shared editable install at the worktree and break the main checkout. (The `uv run` guidance under Environment applies to the main checkout only.)
+- Opening the worktree in VS Code: `.vscode/settings.json` (written per worktree) selects the shared interpreter; `launch.json` follows the window's selection.
 - Anything that shells out to `python` — sbatch scripts in particular — may still resolve to the main checkout, since `sbatch/*.sbatch` hardcode `REPO=`. Don't submit jobs from a worktree without checking that first.
+
+Full workflow, including how Nithya reviews and merges: [docs/workflows/worktrees.md](docs/workflows/worktrees.md).
 
 Your branch is based on the last *commit* on `v/r`; uncommitted work in the main checkout is invisible to you. If a change Nithya mentions seems missing, ask rather than reimplementing it.
 

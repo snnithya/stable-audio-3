@@ -9,7 +9,7 @@
             "name": "Debug debug_dataset.py",
             "type": "python",
             "request": "launch",
-            "python": "${workspaceFolder}/.venv/bin/python",
+            "python": "${command:python.interpreterPath}",
             "program": "${workspaceFolder}/scripts/debug_dataset.py",
             "args": [
                 "--config",
@@ -23,7 +23,7 @@
             "name": "Finetune small-music",
             "type": "python",
             "request": "launch",
-            "python": "${workspaceFolder}/.venv/bin/python",
+            "python": "${command:python.interpreterPath}",
             "program": "${workspaceFolder}/scripts/train_finetune.py",
             "args": [
                 "--model",
@@ -46,7 +46,7 @@
             "name": "lora small-music",
             "type": "python",
             "request": "launch",
-            "python": "${workspaceFolder}/.venv/bin/python",
+            "python": "${command:python.interpreterPath}",
             "program": "${workspaceFolder}/scripts/train_lora.py",
             "args": [
                 "--model",
@@ -69,7 +69,7 @@
             "name": "Pre-encode dataset",
             "type": "python",
             "request": "launch",
-            "python": "${workspaceFolder}/.venv/bin/python",
+            "python": "${command:python.interpreterPath}",
             "program": "${workspaceFolder}/scripts/pre_encode_dataset.py",
             "args": [
                 "--dataset_config",

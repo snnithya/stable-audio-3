@@ -42,6 +42,17 @@ cat > "$wt/.claude/settings.local.json" <<JSON
 }
 JSON
 
+# Editor side of the same problem: there is no .venv here, and launch.json
+# resolves the interpreter from the window's selection. Point both at the
+# shared venv and let Pylance see this worktree's sources.
+mkdir -p "$wt/.vscode"
+cat > "$wt/.vscode/settings.json" <<JSON
+{
+  "python.defaultInterpreterPath": "$main/.venv/bin/python",
+  "python.analysis.extraPaths": ["."]
+}
+JSON
+
 cat <<MSG
 
 Worktree ready:
@@ -49,6 +60,7 @@ Worktree ready:
   path     $wt
 
   cd $wt && claude
+  code $wt          # or: File > Add Folder to Workspace, to see both trees at once
 
 Run things with \$SA3_PY (never 'uv run' / 'uv sync' here — they would build a
 second 4.4G venv or repoint the shared editable install at this worktree):

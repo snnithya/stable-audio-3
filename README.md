@@ -264,6 +264,7 @@ Stable Audio 3 scales from a laptop to a GPU server.
 | [Autoencoder Workflows](docs/workflows/autoencoder.md) | Encode and decode audio with the VAE directly |
 | [Prompting Guide](docs/guides/prompting.md) | Prompt and control signal reference |
 | [Model Overview](docs/guides/model-overview.md) | Architecture and design overview |
+| [Parallel Work with Worktrees](docs/workflows/worktrees.md) | Run agents on their own branch while you keep editing `v/r` |
 
 ---
 
