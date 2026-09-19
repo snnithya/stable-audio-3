@@ -361,6 +361,8 @@ class PreEncodedDataset(torch.utils.data.Dataset):
         controls_dim=None,
         random_crop=False,
         tokenizers: Optional[dict] = None,
+        sample_rate: int = 44100,
+        ds_ratio: int = 4096,
     ):
         super().__init__()
         self.filenames = []
@@ -369,6 +371,10 @@ class PreEncodedDataset(torch.utils.data.Dataset):
         self.custom_metadata_fns = {}
 
         self.silence_latents = {}
+
+        # Needed to express the valid frame count of the (possibly cropped) buffer in seconds.
+        self.sample_rate = sample_rate
+        self.ds_ratio = ds_ratio
 
         for config in configs:
             new_files = get_latent_filenames(
@@ -485,13 +491,21 @@ class PreEncodedDataset(torch.utils.data.Dataset):
 
             info["padding_mask"] = [torch.tensor(info["padding_mask"])]
 
-            seconds_total = info["seconds_total"]
+            # Length filters apply to the whole track, as stored at pre-encode time.
+            track_seconds = info["seconds_total"]
 
-            if self.min_length_sec is not None and seconds_total < self.min_length_sec:
+            if self.min_length_sec is not None and track_seconds < self.min_length_sec:
                 return self[random.randrange(len(self))]
 
-            if self.max_length_sec is not None and seconds_total > self.max_length_sec:
+            if self.max_length_sec is not None and track_seconds > self.max_length_sec:
                 return self[random.randrange(len(self))]
+
+            # Duration conditioning is the valid audio in the buffer, not the track length.
+            # Stable Audio 3 trains with duration == unpadded signal length, so a 12 s crop
+            # of a 4 min track must be labelled ~12 s. The same value drives the schedule
+            # shift and the inference-side padding mask, keeping train/infer consistent.
+            valid_frames = int(info["padding_mask"][0].sum().item())
+            info["seconds_total"] = valid_frames * self.ds_ratio / self.sample_rate
 
             for custom_md_path in self.custom_metadata_fns.keys():
                 if custom_md_path in latent_filename:

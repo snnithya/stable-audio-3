@@ -370,7 +370,8 @@ def build_pre_encoded_dataset(
         random_crop:            Whether to randomly crop within the valid region.
         custom_metadata_module: Optional path to a Python file defining
                                 ``get_custom_metadata(info, latents) -> dict``.
-        sample_rate:            Used to derive ``latent_crop_length`` when not set.
+        sample_rate:            Audio sample rate; with ``ds_ratio`` it converts each
+                                buffer's valid frame count into ``seconds_total``.
         ds_ratio:               Pretransform downsampling ratio.
         duration:               Clip duration in seconds, used to derive crop length.
 
@@ -399,7 +400,13 @@ def build_pre_encoded_dataset(
             f"(duration={duration}s, sample_rate={sample_rate}, ds_ratio={ds_ratio})"
         )
 
-    return PreEncodedDataset([config], latent_crop_length=latent_crop_length, random_crop=random_crop)
+    return PreEncodedDataset(
+        [config],
+        latent_crop_length=latent_crop_length,
+        random_crop=random_crop,
+        sample_rate=sample_rate,
+        ds_ratio=ds_ratio,
+    )
 
 
 def build_sample_dataset(
@@ -536,6 +543,8 @@ def build_dataset_from_config(
             random_crop=config.get("random_crop", True),
             controls=config.get("controls", None),
             controls_dim=config.get("controls_dim", None),
+            sample_rate=sample_rate,
+            ds_ratio=ds_ratio,
         )
 
     elif dataset_type == "sample":
