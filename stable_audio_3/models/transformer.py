@@ -1017,7 +1017,10 @@ class TransformerBlock(nn.Module):
 
         if self.global_cond_dim is not None and self.global_cond_dim > 0 and global_cond is not None:
             
-            scale_self, shift_self, gate_self, scale_ff, shift_ff, gate_ff = (self.to_scale_shift_gate + global_cond).unsqueeze(1).chunk(6, dim=-1)
+            # global_cond is (b, 6*dim) for one modulation per item, or (b, n, 6*dim) for
+            # diffusion forcing, where each token is modulated at its own noise level.
+            gc = global_cond if global_cond.ndim == 3 else global_cond.unsqueeze(1)
+            scale_self, shift_self, gate_self, scale_ff, shift_ff, gate_ff = (self.to_scale_shift_gate + gc).chunk(6, dim=-1)
 
             # self-attention with adaLN
             residual = x
@@ -1164,6 +1167,7 @@ class ContinuousTransformer(nn.Module):
         context = None,
         prepend_embeds = None,
         global_cond = None,
+        prepend_global_cond = None,
         local_add_cond = None,
         modular_local_cond = None,
         return_info = False,
@@ -1209,6 +1213,18 @@ class ContinuousTransformer(nn.Module):
 
         if global_cond is not None and self.global_cond_embedder is not None:
             global_cond = self.global_cond_embedder(global_cond)
+
+            if global_cond.ndim == 3:
+                # Per-frame conditioning covers the latent frames only, but x has been extended
+                # with memory tokens and any prepend conditioning. Those tokens have no noise
+                # level of their own, so they take the summary row the caller supplied.
+                num_prepended = x.shape[1] - global_cond.shape[1]
+                if num_prepended > 0:
+                    assert prepend_global_cond is not None, \
+                        "per-token global_cond needs prepend_global_cond to cover the prepended tokens"
+                    prepend_cond = self.global_cond_embedder(prepend_global_cond)
+                    prepend_cond = prepend_cond.unsqueeze(1).expand(-1, num_prepended, -1)
+                    global_cond = torch.cat([prepend_cond, global_cond], dim=1)
 
         # Extend padding mask for prepended tokens if provided
         extended_padding_mask = None

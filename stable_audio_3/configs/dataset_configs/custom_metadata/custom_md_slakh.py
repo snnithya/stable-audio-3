@@ -43,8 +43,10 @@ def get_custom_metadata(info, audio):
     is_drum = True
     prompt = "drums"
 
+    valid_length = 12 #HACK!
     return {
         "prompt": prompt,
         "is_drum": is_drum,
         "track_id": track_id,
+        "seconds_total": valid_length
     }

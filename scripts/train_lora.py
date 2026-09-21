@@ -119,6 +119,8 @@ def train(args):
             [LatentDatasetConfig(id="train", path=args.encoded_dir)],
             latent_crop_length=sample_size // ds_ratio,
             random_crop=True,
+            sample_rate=sample_rate,
+            ds_ratio=ds_ratio,
         )
     else:
         dataset = SampleDataset(
@@ -189,6 +191,8 @@ def train(args):
         log_every_n_steps=args.log_every,
         ot_coupling=True,
         base_precision=args.base_precision,
+        df_training=model_config.get("training", {}).get("df_training", False),
+        df_p_global=model_config.get("training", {}).get("df_p_global", 0.0),
     )
 
     exc_callback = ExceptionCallback()

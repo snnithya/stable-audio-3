@@ -173,6 +173,29 @@ def train(args):
         worker_init_fn=lambda worker_id: torch.manual_seed(seed + worker_id),
     )
 
+    # Held-out validation. The training wrapper scores a fixed ladder of timesteps
+    # (validation_timesteps, default 0.1..0.9) on every batch and logs val/loss_<t>
+    # plus val/avg_loss, so the split must be read deterministically: no shuffle, and
+    # a config with random_crop off, or the numbers move between evaluations for
+    # reasons that have nothing to do with the model.
+    val_dataloader = None
+    if args.val_dataset_config:
+        print(f"Building validation dataset from config: {args.val_dataset_config}")
+        val_dataset = build_dataset_from_config(
+            args.val_dataset_config, sample_rate, ds_ratio, args.duration
+        )
+        val_dataloader = torch.utils.data.DataLoader(
+            val_dataset,
+            batch_size=args.val_batch_size or args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            drop_last=False,
+            collate_fn=collation_fn,
+        )
+        print(
+            f"Validation: {len(val_dataset)} items, every {args.val_every} training batches"
+        )
+
     optimizer_config = {
         "diffusion": {
             "optimizer": {
@@ -220,6 +243,8 @@ def train(args):
         lora_config=None,
         log_every_n_steps=args.log_every,
         ot_coupling=True,
+        df_training=model_config.get("training", {}).get("df_training", False),
+        df_p_global=model_config.get("training", {}).get("df_p_global", 0.0),
     )
 
     exc_callback = ExceptionCallback()
@@ -318,6 +343,15 @@ def train(args):
     summary = pl.callbacks.ModelSummary(max_depth=2)
     callbacks.append(summary)
 
+    # val_check_interval counts *training batches*, not optimizer steps, so with
+    # --accum_batches > 1 the gap in logged steps is val_every / accum_batches.
+    # check_val_every_n_epoch=None is what lets the interval exceed one epoch.
+    val_kwargs = (
+        {"val_check_interval": args.val_every, "check_val_every_n_epoch": None}
+        if val_dataloader is not None
+        else {}
+    )
+
     trainer = pl.Trainer(
         devices="auto",
         accelerator="auto",
@@ -331,12 +365,14 @@ def train(args):
         default_root_dir=args.save_dir,
         gradient_clip_val=gradient_clip_val,
         reload_dataloaders_every_n_epochs=0,
-        num_sanity_val_steps=0,
+        num_sanity_val_steps=0,  # If you need to debug validation, change this line
+        **val_kwargs,
     )
 
     trainer.fit(
         training_wrapper,
         dataloader,
+        val_dataloaders=val_dataloader,
         ckpt_path=args.resume_ckpt if args.resume_ckpt else None,
     )
 
@@ -368,6 +404,28 @@ def main():
             "Supports multiple datasets, weights, and per-dataset custom_metadata_module. "
             "See script docstring for the config schema."
         ),
+    )
+    p.add_argument(
+        "--val_dataset_config",
+        default=None,
+        help=(
+            "Path to a held-out dataset JSON config. When given, val/loss_<t> and "
+            "val/avg_loss are logged every --val_every training batches. Use a config "
+            "with random_crop off, e.g. "
+            "stable_audio_3/configs/dataset_configs/preencoded/slakh_streamgen_validation_preencoded.json"
+        ),
+    )
+    p.add_argument(
+        "--val_every",
+        type=int,
+        default=1000,
+        help="Training batches between validation runs (used with --val_dataset_config)",
+    )
+    p.add_argument(
+        "--val_batch_size",
+        type=int,
+        default=None,
+        help="Validation batch size (defaults to --batch_size)",
     )
     p.add_argument(
         "--data_dir",

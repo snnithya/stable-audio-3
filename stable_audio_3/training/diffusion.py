@@ -16,6 +16,7 @@ from torch.nn import functional as F
 from ..interface.aeiou import audio_spectrogram_image
 from ..inference.sampling import truncated_logistic_normal_rescaled, sample_timesteps_logsnr, sample_timesteps_logsnr_uniform, sample_diffusion
 from ..models.diffusion import ConditionedDiffusionModelWrapper
+from ..models.dit import _broadcast_t
 from ..models.inpainting import random_inpaint_mask, build_causal_tf_mask, MaskType
 from ..models.lora import add_lora, get_lora_params, get_lora_state_dict, LoRAParametrization, get_lora_layers, save_lora_safetensors, resolve_adapter_type, prepare_dora_state_dict, cast_base_to_precision
 from .utils import create_optimizer_from_config, create_scheduler_from_config, log_audio, log_image, log_demo_table, log_metric, get_rank, create_augmented_padding_mask, compute_masked_loss, compute_normalized_mse, resize_padding_mask, StaggeredLogger, compute_per_elem_trim, trim_and_concat
@@ -46,9 +47,9 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
             self,
             model: ConditionedDiffusionModelWrapper,
             lr: float = None,
-            mask_loss_weight: float = 0.0,
+            mask_loss_weight: float = 0.0, # weight for loss on the inpaint condition
             mask_padding_attention: bool = False,
-            silence_extension_scale_seconds: float = 0.0,
+            silence_extension_scale_seconds: float = 0.0, # extends "valid" region of a sequence with std. dev. 1/scale
             use_ema: bool = True,
             log_loss_info: bool = False,
             optimizer_configs: dict = None,
@@ -70,6 +71,8 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
             log_every_n_steps: int = 10,
             ot_coupling: bool = False,
             base_precision: tp.Optional[str] = None,
+            df_training: bool = False,
+            df_p_global: float = 0.0,
     ):
         super().__init__()
 
@@ -153,6 +156,14 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
 
         self.timestep_sampler_options = {} if timestep_sampler_options is None else timestep_sampler_options
 
+        # Diffusion forcing: sample one noise level per latent frame, t of shape (b, n), instead
+        # of one per item. df_p_global is the probability that an item instead gets a single
+        # shared t across all its frames, which keeps ordinary full-sequence generation in the
+        # training mix and gives a continuous path off the pretrained weights.
+        # See experiments/03-diffusion-forcing/01-local-timestep-conditioning.md.
+        self.df_training = df_training
+        assert 0.0 <= df_p_global <= 1.0, f"df_p_global must be in [0, 1], got {df_p_global}"
+        self.df_p_global = df_p_global
         if self.timestep_sampler == "log_snr":
             self.mean_logsnr = self.timestep_sampler_options.get("mean_logsnr", -1.2)
             self.std_logsnr = self.timestep_sampler_options.get("std_logsnr", 2.0)
@@ -292,6 +303,47 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
 
         conditioning["streamgen_latent"] = [streamgen]
 
+    def _draw_timesteps(self, shape, device):
+        """Draw raw (unshifted) timesteps of the given shape from the configured sampler."""
+        if self.timestep_sampler == "uniform":
+            # Draw uniformly distributed continuous timesteps. SobolEngine.draw takes a count,
+            # not a shape; for a (b, n) draw the quasirandom stratification is over all b*n
+            # frames rather than over the batch.
+            numel = math.prod(shape) if isinstance(shape, tuple) else shape
+            t = self.rng.draw(numel)[:, 0].reshape(shape).to(device)
+        elif self.timestep_sampler == "logit_normal":
+            t = torch.sigmoid(torch.randn(shape, device=device))
+        elif self.timestep_sampler == "trunc_logit_normal":
+            # Draw from logistic truncated normal distribution
+            t = truncated_logistic_normal_rescaled(shape).to(device)
+
+            # Flip the distribution
+            t = 1 - t
+        elif self.timestep_sampler == "log_snr":
+            t = sample_timesteps_logsnr(shape, mean_logsnr=self.mean_logsnr, std_logsnr=self.std_logsnr).to(device)
+        elif self.timestep_sampler == "log_snr_uniform":
+            t = sample_timesteps_logsnr_uniform(shape, min_logsnr=self.min_logsnr, max_logsnr=self.max_logsnr).to(device)
+        else:
+            raise ValueError(f"Invalid timestep_sampler: {self.timestep_sampler}")
+        return t
+
+    def _sample_timesteps(self, batch_size, seq_len, device):
+        """Sample training timesteps: (b,) normally, (b, n) under diffusion forcing.
+
+        With df_training, each item is independently either per-frame -- every latent frame
+        gets its own draw -- or, with probability df_p_global, global -- one draw shared by
+        all of its frames. df_p_global=1.0 is the global-t baseline expressed in (b, n) form.
+        """
+        if not self.df_training:
+            return self._draw_timesteps(batch_size, device)
+
+        t = self._draw_timesteps((batch_size, seq_len), device)
+        if self.df_p_global > 0:
+            t_global = self._draw_timesteps(batch_size, device)
+            use_global = torch.rand(batch_size, device=device) < self.df_p_global
+            t = torch.where(use_global[:, None], t_global[:, None], t)
+        return t
+
     def training_step(self, batch, batch_idx):
         reals, metadata = batch # reals (bs, 256, 256)
 
@@ -335,23 +387,9 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
                 if padding_masks.shape[-1] != diffusion_input.shape[-1]:
                     padding_masks = resize_padding_mask(padding_masks, diffusion_input.shape[-1])
 
-        if self.timestep_sampler == "uniform":
-            # Draw uniformly distributed continuous timesteps
-            t = self.rng.draw(reals.shape[0])[:, 0].to(self.device)
-        elif self.timestep_sampler == "logit_normal":
-            t = torch.sigmoid(torch.randn(reals.shape[0], device=self.device))
-        elif self.timestep_sampler == "trunc_logit_normal":
-            # Draw from logistic truncated normal distribution
-            t = truncated_logistic_normal_rescaled(reals.shape[0]).to(self.device)
-
-            # Flip the distribution
-            t = 1 - t
-        elif self.timestep_sampler == "log_snr":
-            t = sample_timesteps_logsnr(reals.shape[0], mean_logsnr=self.mean_logsnr, std_logsnr=self.std_logsnr).to(self.device)
-        elif self.timestep_sampler == "log_snr_uniform":
-            t = sample_timesteps_logsnr_uniform(reals.shape[0], min_logsnr=self.min_logsnr, max_logsnr=self.max_logsnr).to(self.device)
-        else:
-            raise ValueError(f"Invalid timestep_sampler: {self.timestep_sampler}")
+        # t is (b,) or, under diffusion forcing, (b, n) with n the number of *latent* frames --
+        # diffusion_input is post-pretransform here, reals is not.
+        t = self._sample_timesteps(diffusion_input.shape[0], diffusion_input.shape[2], diffusion_input.device)
 
         if self.diffusion.dist_shift is not None:
             # Compute sequence length for schedule shift
@@ -376,17 +414,20 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
             t = self.diffusion.dist_shift.shift(t, effective_seq_len)
 
         if self.p_one_shot > 0:
-            # Set t to 1 with probability p_one_shot
-            t = torch.where(torch.rand_like(t) < self.p_one_shot, torch.ones_like(t), t)
+            # Set t to 1 with probability p_one_shot, per item (not per frame when t is (b, n))
+            one_shot = torch.rand(t.shape[0], device=t.device) < self.p_one_shot
+            if t.ndim == 2:
+                one_shot = one_shot[:, None]
+            t = torch.where(one_shot, torch.ones_like(t), t)
 
         # Calculate the noise schedule parameters for those timesteps
         # Note: bot rectified flow and rf_denoiser train with the RF objective, during inference rf_denoiser uses a pingpong sampler where as rectified flow uses and ODE solver.
         if self.diffusion_objective in ["rectified_flow", "rf_denoiser"]:
             alphas, sigmas = 1-t, t
 
-        # Combine the ground truth data and the noise
-        alphas = alphas[:, None, None]
-        sigmas = sigmas[:, None, None]
+        # Combine the ground truth data and the noise. (b, 1, 1), or (b, 1, n) for per-frame t.
+        alphas = _broadcast_t(alphas)
+        sigmas = _broadcast_t(sigmas)
         noise = torch.randn_like(diffusion_input)
 
         # Minibatch OT coupling: find optimal noise permutation for straighter transport paths
@@ -477,13 +518,14 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
             bucket_size = 1 / num_loss_buckets
             loss_all = F.mse_loss(output, targets, reduction="none")
 
-            sigmas = rearrange(self.all_gather(sigmas), "w b c n -> (w b) c n").squeeze()
-
-            # gather loss_all across all GPUs
+            # gather across all GPUs; sigmas is (b, 1, 1) or, for per-frame t, (b, 1, n)
+            sigmas_all = rearrange(self.all_gather(sigmas), "w b c n -> (w b) c n")
             loss_all = rearrange(self.all_gather(loss_all), "w b c n -> (w b) c n")
 
-            # Bucket loss values based on corresponding sigma values, bucketing sigma values by bucket_size
-            loss_all = torch.stack([loss_all[(sigmas >= i) & (sigmas < i + bucket_size)].mean() for i in torch.arange(0, 1, bucket_size).to(self.device)])
+            # Bucket every loss element by the sigma it was computed at. Expanding sigma to the
+            # loss shape makes this rank-agnostic: one sigma per item or one per frame.
+            sigmas_all = sigmas_all.expand_as(loss_all)
+            loss_all = torch.stack([loss_all[(sigmas_all >= i) & (sigmas_all < i + bucket_size)].mean() for i in torch.arange(0, 1, bucket_size).to(self.device)])
 
             # Log bucketed losses with corresponding sigma bucket values, if it's not NaN
             debug_log_dict = {
@@ -548,9 +590,14 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
         log_dict["train/mse_loss"] = mse_loss.detach()
         log_dict["train/loss"] = loss.detach()
 
-        # Stash for external callbacks (e.g. loss-by-timestep logging)
-        self._last_t = t.detach()
-        self._last_per_elem_loss = mse_loss_full.detach().mean(dim=(1, 2))
+        # Stash for external callbacks (e.g. loss-by-timestep logging). One (t, loss) pair per
+        # item for global t; per frame for per-frame t, so loss-by-timestep keeps its meaning.
+        if t.ndim == 2:
+            self._last_t = t.detach().reshape(-1)
+            self._last_per_elem_loss = mse_loss_full.detach().mean(dim=1).reshape(-1)
+        else:
+            self._last_t = t.detach()
+            self._last_per_elem_loss = mse_loss_full.detach().mean(dim=(1, 2))
 
         self._staggered_logger.log(log_dict, self)
 
@@ -620,8 +667,8 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
                 alphas, sigmas = 1-t, t
 
             # Combine the ground truth data and the noise
-            alphas = alphas[:, None, None]
-            sigmas = sigmas[:, None, None]
+            alphas = _broadcast_t(alphas)
+            sigmas = _broadcast_t(sigmas)
             noise = torch.randn_like(diffusion_input)
             noised_inputs = diffusion_input * alphas + noise * sigmas
 

@@ -43,6 +43,49 @@
             }
         },
         {
+            // Step through one diffusion-forcing training step. Single process, no logger,
+            // batch of 2, so breakpoints in DiffusionCondTrainingWrapper.training_step and
+            // DiffusionTransformer._forward are hit immediately.
+            "name": "Debug DF training step",
+            "type": "python",
+            "request": "launch",
+            "python": "${command:python.interpreterPath}",
+            "program": "${workspaceFolder}/scripts/train_finetune.py",
+            "args": [
+                "--model",
+                "small-music-base",
+                "--dataset_config",
+                "${workspaceFolder}/stable_audio_3/configs/dataset_configs/preencoded/local_babyslakh_streamgen_preencoded.json",
+                "--model_config",
+                "${workspaceFolder}/stable_audio_3/configs/model_configs/small_music_base_df.json",
+                "--save_dir",
+                "/data/scratch-fast/snnithya/sao-3/ft_checkpoints/debug",
+                "--steps",
+                "5",
+                "--batch_size",
+                "2",
+                "--num_workers",
+                "0",
+                "--log_every",
+                "1",
+                "--checkpoint_every",
+                "1000",
+                "--demo_every",
+                "1000",
+                "--freeze_conditioner",
+                "--logger",
+                "none",
+                "--name",
+                "df-debug"
+            ],
+            "envFile": "${workspaceFolder}/.env",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "0"
+            }
+        },
+        {
             "name": "lora small-music",
             "type": "python",
             "request": "launch",

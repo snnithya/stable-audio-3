@@ -1,5 +1,6 @@
 import typing as tp
 import math
+import warnings
 import torch
 
 from einops import rearrange
@@ -10,18 +11,31 @@ from .blocks import FourierFeatures, ExpoFourierFeatures
 from .transformer import ContinuousTransformer        
 from .lora import LoRAParametrization, set_lora_strength, has_lora, enable_lora, disable_lora, filter_lora_layers
 
+def _broadcast_t(t: torch.Tensor) -> torch.Tensor:
+    """Reshape a timestep-like tensor so it broadcasts against x of shape (b, c, n).
+
+    (b,) -> (b, 1, 1): one noise level per item.
+    (b, n) -> (b, 1, n): one noise level per latent frame (diffusion forcing).
+    """
+    if t.ndim == 1:
+        return t[:, None, None]
+    if t.ndim == 2:
+        return t[:, None, :]
+    raise ValueError(f"expected t of shape (b,) or (b, n), got {tuple(t.shape)}")
+
+
 class DiffusionTransformer(nn.Module):
     def __init__(self,
-        io_channels=32,
-        patch_size=1,
-        embed_dim=768,
+        io_channels=32, # number of input/output channels
+        patch_size=1, # converts time to channels (b (t p) c) -> (b t (c p))
+        embed_dim=768, # internal embedding dimension of transformer
         cond_token_dim=0,
         project_cond_tokens=True,
         global_cond_dim=0,
         project_global_cond=True,
         input_concat_dim=0,
         prepend_cond_dim=0,
-        depth=12,
+        depth=12, # number of transformer blocks
         num_heads=8,
         transformer_type: tp.Literal["continuous_transformer", "mm_transformer"] = "continuous_transformer",
         global_cond_type: tp.Literal["prepend", "adaLN"] = "prepend",
@@ -31,6 +45,7 @@ class DiffusionTransformer(nn.Module):
         timestep_features_type: tp.Literal["learned", "expo"] = "learned",
         timestep_features_dim = 256,
         timestep_features_logsnr: bool = False,
+        df_register_cond_t: float = 0.537,
         modular_local_cond_configs = None,
         **kwargs):
 
@@ -41,6 +56,13 @@ class DiffusionTransformer(nn.Module):
         # Timestep embeddings
         self.timestep_cond_type = timestep_cond_type
         self.timestep_features_logsnr = timestep_features_logsnr
+
+        # Diffusion forcing: the tokens prepended inside the transformer (memory tokens, prepend
+        # conditioning) are not latent frames and have no noise level of their own. When t is
+        # per-frame they are conditioned at this fixed t instead, independent of the sampling
+        # schedule. 0.537 is the mean of the trunc_logit_normal training sampler; see
+        # experiments/03-diffusion-forcing/01-local-timestep-conditioning.md.
+        self.df_register_cond_t = df_register_cond_t
 
         timestep_features_dim = timestep_features_dim
 
@@ -194,6 +216,16 @@ class DiffusionTransformer(nn.Module):
         exit_layer_ix=None,
         **kwargs):
 
+        # Diffusion forcing gives every latent frame its own noise level, which only adaLN can
+        # represent: a prepended global-conditioning token cannot carry a per-frame signal, and
+        # patching would make the timestep vector and the token sequence different lengths.
+        per_frame_t = t.ndim == 2
+        if per_frame_t:
+            assert self.global_cond_type == "adaLN", \
+                f"per-frame timesteps require global_cond_type='adaLN', got '{self.global_cond_type}'"
+            assert self.patch_size == 1, \
+                f"per-frame timesteps require patch_size=1, got {self.patch_size}"
+
         if cross_attn_cond is not None:
             cross_attn_cond = self.to_cond_embed(cross_attn_cond)
 
@@ -236,17 +268,42 @@ class DiffusionTransformer(nn.Module):
         # Convert to model dtype for linear layers (t itself is kept in float32 for precision)
         # x has already been converted to model dtype in the outer forward() method
         t_cond = t_cond.to(x.dtype)
-        timestep_embed = self.to_timestep_embed(self.timestep_features(t_cond[:, None])) # (b, embed_dim)
+        # t is (b,) for a single noise level per item, or (b, t) for diffusion forcing, where
+        # every latent frame carries its own. Both are last-dim ops on the Fourier features.
+        timestep_embed = self.to_timestep_embed(self.timestep_features(t_cond[..., None])) # (b, embed_dim) or (b, t, embed_dim)
+
+        # Diffusion forcing: the tokens prepended inside the transformer (memory tokens, and
+        # prepend conditioning when there is any) are not latent frames and have no noise level
+        # of their own, so they get one conditioning row at a fixed t. See
+        # experiments/03-diffusion-forcing/01-local-timestep-conditioning.md for why this is a
+        # constant rather than a padding value or a summary of the window.
+        prepend_timestep_embed = None
+        if per_frame_t:
+            summary_t = torch.full_like(t[:, 0], self.df_register_cond_t)
+            summary_cond = self._t_to_logsnr_cond(summary_t) if self.timestep_features_logsnr else summary_t
+            prepend_timestep_embed = self.to_timestep_embed(
+                self.timestep_features(summary_cond.to(x.dtype)[..., None])
+            ) # (b, embed_dim)
 
         # Timestep embedding is considered a global embedding. Add to the global conditioning if it exists
 
+        prepend_global_embed = None
         if self.timestep_cond_type == "global":
             if global_embed is not None:
-                global_embed = global_embed + timestep_embed
+                if per_frame_t:
+                    # global_embed is per-item, timestep_embed is per-frame
+                    prepend_global_embed = global_embed + prepend_timestep_embed # similar treatment to other timesteps, being added to global_embed
+                    global_embed = global_embed.unsqueeze(1) + timestep_embed
+                else:
+                    global_embed = global_embed + timestep_embed
             else:
                 global_embed = timestep_embed
+                prepend_global_embed = prepend_timestep_embed
         elif self.timestep_cond_type == "input_concat":
-            x = torch.cat([x, timestep_embed.unsqueeze(2).expand(-1, -1, x.shape[2])], dim=1)
+            if per_frame_t:
+                x = torch.cat([x, rearrange(timestep_embed, "b t c -> b c t")], dim=1)
+            else:
+                x = torch.cat([x, timestep_embed.unsqueeze(2).expand(-1, -1, x.shape[2])], dim=1)
 
         # Add the global_embed to the prepend inputs if there is no global conditioning support in the transformer
         if self.global_cond_type == "prepend" and global_embed is not None:
@@ -269,6 +326,8 @@ class DiffusionTransformer(nn.Module):
 
         if self.global_cond_type == "adaLN":
             extra_args["global_cond"] = global_embed
+            if prepend_global_embed is not None:
+                extra_args["prepend_global_cond"] = prepend_global_embed
 
         if self.patch_size > 1:
             x = rearrange(x, "b (t p) c -> b t (c p)", p=self.patch_size)
@@ -381,7 +440,8 @@ class DiffusionTransformer(nn.Module):
 
         # Keep t in float32: the logsnr transform log((1-t)/t) amplifies bf16
         # quantization error ~380x near t=1, causing catastrophic conditioning errors.
-        # t is a 1D batch-size tensor so float32 has zero memory impact.
+        # t is (b,) or, under diffusion forcing, (b, n) -- either way small enough that
+        # float32 has no meaningful memory impact.
         t = t.float()
 
         if cross_attn_cond is not None:
@@ -454,8 +514,18 @@ class DiffusionTransformer(nn.Module):
             alpha = torch.cos(t * math.pi / 2)
         elif self.diffusion_objective in ["rectified_flow", "rf_denoiser"]:
             sigma = t
+            alpha = None
 
-        # LoRA interval
+        # (b, 1, 1) or, under diffusion forcing, (b, 1, n): broadcasts against x of (b, c, n).
+        sigma_b = _broadcast_t(sigma)
+        alpha_b = _broadcast_t(alpha) if alpha is not None else None
+        per_frame_t = t.ndim == 2
+
+        # LoRA interval. Enabling an adapter is module-wide, so there is no per-frame version
+        # of the interval: under diffusion forcing "is sigma in the window" has no single
+        # answer. Not supported with per-frame t; warn and gate on the first frame of the
+        # first item so the forward still runs.
+        lora_sigma = sigma.reshape(-1)[0]
         if has_lora(self):
             if lora_configs is not None:
                 # Multi-LoRA: per-LoRA interval and layer filter
@@ -463,20 +533,35 @@ class DiffusionTransformer(nn.Module):
                     idx = lora_config["lora_index"]
                     interval = lora_config.get("interval", (0, 1))
                     layer_filter = lora_config.get("layer_filter", "")
-                    if interval[0] <= sigma[0] <= interval[1]:
+                    if per_frame_t and tuple(interval) != (0, 1):
+                        warnings.warn(
+                            f"LoRA interval {tuple(interval)} is per-forward, not per-frame; with "
+                            f"per-frame t it is gated on sigma[0, 0] only.", stacklevel=2)
+                    if interval[0] <= lora_sigma <= interval[1]:
                         enable_lora(self, lora_index=idx)
                         filter_lora_layers(self, layer_filter, lora_index=idx)
                     else:
                         disable_lora(self, lora_index=idx)
             else:
                 # Legacy single-LoRA path
-                if lora_interval[0] <= sigma[0] <= lora_interval[1]:
+                if per_frame_t and tuple(lora_interval) != (0, 1):
+                    warnings.warn(
+                        f"lora_interval {tuple(lora_interval)} is per-forward, not per-frame; with "
+                        f"per-frame t it is gated on sigma[0, 0] only.", stacklevel=2)
+                if lora_interval[0] <= lora_sigma <= lora_interval[1]:
                     enable_lora(self)
                     filter_lora_layers(self, lora_layer_filter)
                 else:
                     disable_lora(self)
 
-        if cfg_scale != 1.0 and (cross_attn_cond is not None or prepend_cond is not None) and (cfg_interval[0] <= sigma[0] <= cfg_interval[1]):
+        # The CFG interval is evaluated per element of sigma: per item for (b,) t, per frame
+        # for (b, n) t. The cond/uncond pass runs if any element is in the window, and the
+        # guided estimate is then used only where it is; the rest keeps the conditional
+        # estimate. (Previously the whole batch was gated on sigma[0], which was also wrong
+        # for per-item schedules.)
+        cfg_in_window = (sigma_b >= cfg_interval[0]) & (sigma_b <= cfg_interval[1])
+
+        if cfg_scale != 1.0 and (cross_attn_cond is not None or prepend_cond is not None) and bool(cfg_in_window.any()):
 
             # Classifier-free guidance
             # Concatenate conditioned and unconditioned inputs on the batch dimension            
@@ -573,12 +658,12 @@ class DiffusionTransformer(nn.Module):
             cond_output, uncond_output = torch.chunk(batch_output, 2, dim=0)
 
             if self.diffusion_objective == "v":
-                cond_denoised = x * alpha[:, None, None] - cond_output * sigma[:, None, None]
-                uncond_denoised = x * alpha[:, None, None] - uncond_output * sigma[:, None, None]
+                cond_denoised = x * alpha_b - cond_output * sigma_b
+                uncond_denoised = x * alpha_b - uncond_output * sigma_b
 
             elif self.diffusion_objective in ["rectified_flow", "rf_denoiser"]:
-                cond_denoised = x - cond_output * sigma[:, None, None]
-                uncond_denoised = x - uncond_output * sigma[:, None, None]
+                cond_denoised = x - cond_output * sigma_b
+                uncond_denoised = x - uncond_output * sigma_b
 
             diff = cond_denoised - uncond_denoised
             
@@ -605,12 +690,15 @@ class DiffusionTransformer(nn.Module):
                 diff_parallel, diff_orthogonal = self.apg_project(diff, cond_denoised, padding_mask=padding_mask)
                 cfg_diff = apg_scale * diff_orthogonal + (1 - apg_scale) * diff
 
-            cfg_denoised = cond_denoised + (cfg_scale - 1) * cfg_diff
-                    
+            cfg_denoised = cond_denoised + (cfg_scale - 1) * cfg_diff # equivaluent of uncond + omega * diff
+
+            # Outside the CFG interval, fall back to the conditional estimate (per item / per frame)
+            cfg_denoised = torch.where(cfg_in_window, cfg_denoised, cond_denoised)
+
             if self.diffusion_objective == "v":
-                output = (x * alpha[:, None, None] - cfg_denoised) / sigma[:, None, None]
+                output = (x * alpha_b - cfg_denoised) / sigma_b
             elif self.diffusion_objective in ["rectified_flow", "rf_denoiser"]:
-                output = (x - cfg_denoised) / sigma[:, None, None]
+                output = (x - cfg_denoised) / sigma_b
 
             # CFG Rescale
             if scale_phi != 0.0:

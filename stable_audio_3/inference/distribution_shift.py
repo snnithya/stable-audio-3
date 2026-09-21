@@ -3,6 +3,19 @@ import torch
 import typing as tp
 
 
+def _align_per_item(param: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    """Make a per-item (batch,) shift parameter broadcast against a (batch, n) t.
+
+    Without this, (batch,) against (batch, n) either raises or -- when batch == n --
+    silently applies item i's shift to frame i of every item.
+    """
+    if t.dim() == 2 and param.dim() == 1:
+        assert param.shape[0] == t.shape[0], \
+            f"per-item shift parameter has {param.shape[0]} entries for a batch of {t.shape[0]}"
+        return param.unsqueeze(1)
+    return param
+
+
 class IdentityDistributionShift:
     """No-op distribution shift — returns timesteps unchanged."""
     def shift(self, t: torch.Tensor, seq_len):
@@ -78,6 +91,7 @@ class FluxDistributionShift:
             if t.dim() == 1 and alpha.dim() == 1 and t.shape[0] != alpha.shape[0]:
                 t = t.unsqueeze(0)
                 alpha = alpha.unsqueeze(1)
+            alpha = _align_per_item(alpha, t)
 
         return alpha * t / (1 + (alpha - 1.0) * t)
 
@@ -113,6 +127,7 @@ class DistributionShift:
                 # Result: (batch, steps)
                 t = t.unsqueeze(0)
                 seq_len_clamped = seq_len_clamped.unsqueeze(1)
+            seq_len_clamped = _align_per_item(seq_len_clamped, t)
             sigma = 1.0
             mu = - (self.base_shift + (self.max_shift - self.base_shift) * (seq_len_clamped - self.min_length) / (self.max_length - self.min_length))
             t_out = 1 - torch.exp(mu) / (torch.exp(mu) + (1 / (1 - t) - 1) ** sigma)
@@ -186,6 +201,7 @@ class LogSNRShift:
             if t.dim() == 1 and logsnr_start.dim() == 1 and t.shape[0] != logsnr_start.shape[0]:
                 t = t.unsqueeze(0)
                 logsnr_start = logsnr_start.unsqueeze(1)
+            logsnr_start = _align_per_item(logsnr_start, t)
 
         # Map t through log-SNR space (monotonically: low t → high logsnr → low t_out)
         logsnr = self.logsnr_end - t * (self.logsnr_end - logsnr_start)

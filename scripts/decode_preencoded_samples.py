@@ -98,6 +98,8 @@ def build_dataset(cfg, args, sample_rate, ds_ratio, duration):
         random_crop=False,
         controls=controls,
         controls_dim=controls_dim,
+        sample_rate=sample_rate,
+        ds_ratio=ds_ratio,
     )
 
 
