@@ -2,6 +2,7 @@
 #SBATCH --job-name=df-test
 #SBATCH --partition=hai-res-l40s
 #SBATCH --account=hai-res
+#SBATCH --qos=hai-res-main
 #SBATCH --gres=gpu:l40s:2
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=128G
@@ -30,7 +31,7 @@ python scripts/train_finetune.py \
     --dataset_config stable_audio_3/configs/dataset_configs/preencoded/slakh_streamgen_train_preencoded.json \
     --val_dataset_config stable_audio_3/configs/dataset_configs/preencoded/slakh_streamgen_validation_preencoded.json \
     --val_every 1000 \
-    --steps 10000 \
+    --steps 300000 \
     --batch_size 8 \
     --seed 42 \
     --freeze_conditioner \
@@ -42,7 +43,8 @@ python scripts/train_finetune.py \
     --group df-tests \
     --name df-slakh \
     --save_dir /data/scratch-fast/snnithya/sao-3/ft_checkpoints/ \
-    --num_sanity_val_steps=0
+    --resume_ckpt /data/scratch-fast/snnithya/sao-3/ft_checkpoints/sao-3/7tvd98n0/checkpoints/last.ckpt \
+    --wandb_id 7tvd98n0
 
 
 echo "finished=$(date -Is)"

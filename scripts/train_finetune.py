@@ -250,7 +250,13 @@ def train(args):
     exc_callback = ExceptionCallback()
 
     if args.logger == "wandb":
-        logger = pl.loggers.WandbLogger(project=args.project, name=args.name, group=args.group)
+        # With --wandb_id, reattach to an existing run so a resumed job continues the same
+        # curves instead of starting a fresh one. resume="must" fails loudly if the id is
+        # wrong, rather than silently creating a new run under a mistyped id.
+        wandb_kwargs = {"id": args.wandb_id, "resume": "must"} if args.wandb_id else {}
+        logger = pl.loggers.WandbLogger(
+            project=args.project, name=args.name, group=args.group, **wandb_kwargs
+        )
         logger.watch(training_wrapper)
         if args.save_dir and isinstance(logger.experiment.id, str):
             checkpoint_dir = os.path.join(
@@ -492,6 +498,15 @@ def main():
         "--resume_ckpt",
         default=None,
         help="Path to a PyTorch Lightning .ckpt to resume training from",
+    )
+    p.add_argument(
+        "--wandb_id",
+        default=None,
+        help=(
+            "Existing wandb run id to resume logging into (used with --resume_ckpt so the "
+            "continued run shares one set of curves). Checkpoints then also go back to that "
+            "run's existing checkpoint directory."
+        ),
     )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--logger", choices=["wandb", "comet", "csv", "none"], default="wandb")

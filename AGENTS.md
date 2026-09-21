@@ -8,17 +8,17 @@ This repo extends [Stable Audio 3](https://github.com/Stability-AI/stable-audio-
 
 ## Branch & worktree policy (agents)
 
-**Never work in the main checkout** (`/data/hai-res/snnithya/stable-audio-3`). Nithya edits and runs jobs there on `v/r` at the same time you are working; switching branches or writing files there would clobber that.
+**Default: work in the main checkout on the branch that is checked out** (`/data/hai-res/snnithya/stable-audio-3`). Do not switch branches there; Nithya runs jobs from it.
 
-One task = one branch = one worktree. At the start of a task, from the main checkout:
+**Worktrees are optional.** Use one only when Nithya asks for it, or when the task needs a branch other than the one checked out (e.g. Nithya is mid-edit on the same files and wants the agent's work isolated). Then, from the main checkout:
 
 ```bash
 scripts/new_worktree.sh <task-name>     # branch claude/<task-name>, worktree in ../sa3-wt/<task-name>
 ```
 
-Then work only inside that worktree, commit there, and stop — Nithya reviews and merges (`git diff v/r...claude/<task-name>`). Do not merge into `v/r` or push unless asked.
+Then work only inside that worktree, commit there, and stop — Nithya reviews and merges (`git diff <base>...claude/<task-name>`). Do not merge or push unless asked.
 
-**Running code in a worktree.** The shared `.venv` has an editable install whose path is hardcoded to the main checkout, so:
+**Running code in a worktree** (only relevant if you are in one). The shared `.venv` has an editable install whose path is hardcoded to the main checkout, so:
 
 - Use `$SA3_PY` (set by the worktree's `.claude/settings.local.json`), e.g. `$SA3_PY -m pytest tests/...`.
 - `PYTHONPATH` is pinned to the worktree root, which is what makes `import stable_audio_3` resolve to *your* code. Without it, `$SA3_PY scripts/foo.py` silently imports the main checkout's source instead.
@@ -28,7 +28,7 @@ Then work only inside that worktree, commit there, and stop — Nithya reviews a
 
 Full workflow, including how Nithya reviews and merges: [docs/workflows/worktrees.md](docs/workflows/worktrees.md).
 
-Your branch is based on the last *commit* on `v/r`; uncommitted work in the main checkout is invisible to you. If a change Nithya mentions seems missing, ask rather than reimplementing it.
+A worktree branch is based on the last *commit* of its base; uncommitted work in the main checkout is invisible from it. If a change Nithya mentions seems missing, ask rather than reimplementing it.
 
 
 ## Project goals (edit as scope evolves)

@@ -1,12 +1,14 @@
 # Parallel work with git worktrees
 
-Agents work on their own branch in their own directory, so you can keep editing
-and running jobs in the main checkout at the same time. A branch alone is not
-enough for this: one directory holds one checked-out branch, so an agent that
-ran `git checkout -b` in the main checkout would pull the files out from under
-you. Each task therefore gets a **branch and a worktree**.
+Optional isolation for agent work. By default agents work in the main checkout on
+whatever branch is checked out (see AGENTS.md). When you want an agent's work kept
+apart -- you are mid-edit on the same files, or the task belongs on another branch --
+give it its own branch in its own directory. A branch alone is not enough for this:
+one directory holds one checked-out branch, so an agent that ran `git checkout -b`
+in the main checkout would pull the files out from under you. Such a task therefore
+gets a **branch and a worktree**.
 
-- **Main checkout** — `/data/hai-res/snnithya/stable-audio-3`, your `v/r` work. Agents never touch it.
+- **Main checkout** — `/data/hai-res/snnithya/stable-audio-3`, your current branch. Agents work here unless told otherwise, and never switch branches.
 - **Agent worktrees** — `../sa3-wt/<task-name>` on branch `claude/<task-name>`, sharing the main checkout's `.git` and `.venv`.
 
 Because the `.git` directory is shared, an agent's commits are visible to you

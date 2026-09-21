@@ -71,7 +71,7 @@ The cost is entirely in the ~8 places that assume `t` has a batch axis and nothi
 |---|------|----------|--------|
 | 3.1 | [Local timestep conditioning](01-local-timestep-conditioning.md) | Can per-frame `t` reach adaLN, correctly aligned, without disturbing the global path? | **done at toy scale** — model, CFG path and trainer all landed; 56 tests pass. Production run not done |
 | 3.2 | [Training with independent per-frame `t`](02-training-with-per-frame-t.md) | Does it converge from the existing checkpoint, and does full-sequence quality survive? | **configured, not launched** (`sbatch/df_test.sh`) |
-| 3.3 | Per-frame inference schedules | Do pyramid / rolling schedules work, and do they roll out past the training window? | not started |
+| 3.3 | [Per-frame inference schedules](03-per-frame-inference-schedules.md) | Does a rolling per-frame schedule give more coherent 4 s chunk seams than block-uniform denoising, at the same latency? Rollout past the window deferred. | **planned** — plan written 2026-09-21, nothing implemented |
 | 3.4 | DF vs. inpainting | Does per-frame `t` subsume `tf_inpaint_mask`, or are they complementary? | not started |
 | 3.5 | Causality | Does the rolling regime need causal attention, or is bidirectional-with-per-frame-`t` enough? | not started |
 
