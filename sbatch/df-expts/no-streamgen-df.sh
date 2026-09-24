@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=df-test
+#SBATCH --job-name=no-streamgen-df
 #SBATCH --partition=hai-res-l40s
 #SBATCH --account=hai-res
 #SBATCH --qos=hai-res-main
@@ -30,7 +30,7 @@ export PYTHONPATH=$PWD
 source /data/hai-res/snnithya/stable-audio-3/.venv/bin/activate 
 srun python scripts/train_finetune.py \
     --model small-music-base \
-    --model_config  stable_audio_3/configs/model_configs/small_music_base_df.json\
+    --model_config  stable_audio_3/configs/model_configs/small_music_base_df_no_streamgen.json\
     --dataset_config stable_audio_3/configs/dataset_configs/preencoded/slakh_streamgen_train_preencoded.json \
     --val_dataset_config stable_audio_3/configs/dataset_configs/preencoded/slakh_streamgen_validation_preencoded.json \
     --val_every 1000 \
@@ -39,15 +39,12 @@ srun python scripts/train_finetune.py \
     --seed 42 \
     --freeze_conditioner \
     --checkpoint_every 5000 \
-    --demo_every 10000 \
+    --demo_every 100000 \
     --log_every 100 \
     --logger wandb \
     --project sao-3 \
     --group df-tests \
     --name df-slakh \
     --save_dir /data/scratch-fast/snnithya/sao-3/ft_checkpoints/ \
-    --resume_ckpt /data/scratch-fast/snnithya/sao-3/ft_checkpoints/sao-3/7tvd98n0/checkpoints/last.ckpt \
-    --wandb_id 7tvd98n0
-
 
 echo "finished=$(date -Is)"
