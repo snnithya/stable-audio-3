@@ -1,0 +1,13 @@
+{
+    "dataset_type": "audio_dir",
+    "output_path": "/data/hai-res/shared/snnithya/sao-3/data/wjd/preencoded/train/",
+    "datasets": [
+        {"id": "bass",   "path": "/data/hai-res/shared/snnithya/sao-3/data/wjd/wjd-stem-mirror/train/tracks/bass",   "custom_metadata_module": "stable_audio_3/configs/dataset_configs/custom_metadata/custom_md_wjd.py"},
+        {"id": "other",  "path": "/data/hai-res/shared/snnithya/sao-3/data/wjd/wjd-stem-mirror/train/tracks/other",  "custom_metadata_module": "stable_audio_3/configs/dataset_configs/custom_metadata/custom_md_wjd.py"},
+        {"id": "piano",  "path": "/data/hai-res/shared/snnithya/sao-3/data/wjd/wjd-stem-mirror/train/tracks/piano",  "custom_metadata_module": "stable_audio_3/configs/dataset_configs/custom_metadata/custom_md_wjd.py"},
+        {"id": "guitar", "path": "/data/hai-res/shared/snnithya/sao-3/data/wjd/wjd-stem-mirror/train/tracks/guitar", "custom_metadata_module": "stable_audio_3/configs/dataset_configs/custom_metadata/custom_md_wjd.py"}
+    ],
+    "features": ["drums_rms"],
+    "sanity_check_samples": 2,
+    "_comment": "WJD stem mirror, train split (experiments/03-wjd-jazz-stems/03-dataset-and-wiring.md). Items are WHOLE TRACKS, one per target stem; the prompt is the stem's instrument name(s) from meta/<Track>.json and the condition is the drum stem's causal RMS envelope at the latent rate (1 channel, stable_audio_3/data/features.py), written into the controls sidecar by --features. Four dataset entries, so the output lands in <output_path>/{bass,other,piano,guitar}/ with independent id sequences; the pre-encoded config lists all four paths. Pass --sample_size on the CLI, never here (see the Slakh configs for why). Tracks are 131-901 s, median 310 s: encode whole tracks with --sample_size 16760832 --batch_size 1 and no --pad (380 s cap; the 12 longer tracks lose their tail) and crop at train time with latent_crop_length + random_crop. WJD_CONTROL_MODE=audio in the environment switches the module to returning the drum waveform under drums_audio instead (then use --controls drums_audio); 'both' gives both. No augmentation: --features and --augment_variants > 1 are mutually exclusive. The silence gates apply to the target only; the drums are gated by the module (RMS floor over the valid window)."
+}

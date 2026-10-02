@@ -344,6 +344,12 @@ class SampleDataset(torch.utils.data.Dataset):
                 
                     del info["__audio__"]
 
+                # Frame-rate feature controls (see stable_audio_3/data/features.py) are
+                # already on the latent grid, so unlike `__audio__` they get no pad/crop here;
+                # the metadata fn is responsible for computing them over the padded window.
+                if "__features__" in info:
+                    info.update(info.pop("__features__"))
+
             return (audio, info)
         except Exception as e:
             print(f'Couldn\'t load file {audio_filename}: {e}')

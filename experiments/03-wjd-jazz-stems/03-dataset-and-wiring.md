@@ -1,7 +1,32 @@
 # 3.3 — Dataset build, wiring, and the drum-latent finetune
 
-**Status:** planned
-**Depends on:** 3.1 (aligned audio), 3.2 (stems). The metadata module and configs can be written and unit-tested on a hand-made fixture before either lands.
+**Status:** **mirror built, wiring written and unit-tested** (2026-10-01); pre-encode and finetune not run
+**Depends on:** 3.1 (aligned audio), 3.2 (stems — done, 166 tracks, BS-Roformer-SW).
+
+## Decisions 2026-10-01 (Nithya)
+
+Taken before the build; they override the original plan below where the two differ.
+
+| Question | Decision | Consequence |
+|---|---|---|
+| Items | **Whole tracks**, not JSD segments | One file per target stem per track. JSD segments are written to `meta/` (both clocks) so a segment cut or a segment-aware prompt can be added later without reopening the database. Prompts are track-level. |
+| File placement | **Copy** the stems (not link) | 6.6 GB mirror next to the 8.8 GB stems. |
+| Targets | **bass, other, piano; guitar only where non-silent**; vocals never | Whole-file RMS floor −50 dBFS from `done.json`; same floor for every target stem. |
+| Prompt | **Short instrument names only** | `"upright bass"`, `"piano"`, `"guitar"`, and for `other` the lineup's front line, e.g. `"trumpet, tenor saxophone"` (lineup order). Style / feel / tempo not appended. |
+| Splits | **By track**, seeded shuffle, 12 % validation | Not by record as planned. `splits.json` records seed 0. |
+| Control | **Causal drum RMS envelope** at the latent rate, 1 channel | The 3.4 "R1" representation, moved up to be the first thing trained; the drum *latent* is kept as an option (`WJD_CONTROL_MODE=audio`) rather than the default. |
+| Where | `tap-dance-expt` in the `sa3-tap` checkout, as 3.1/3.2 | |
+
+**What was built** (all on the branch, `tests/test_wjd_metadata.py` covers it, 22 tests):
+
+- `scripts/wjd/make_stem_mirror.py` — the Slakh-mirror analogue: `tracks/<inst>/<Track>/<inst>.flac`, `meta/<Track>.json`, `report.html` per split, `splits.json`, `_skipped.json`.
+- `stable_audio_3/configs/dataset_configs/custom_metadata/custom_md_wjd.py` — prompt from `meta/`, drums found from the target path, rejected if silent over the window; returns the RMS feature under `__features__` (or the waveform under `__audio__`).
+- `stable_audio_3/data/features.py` — `block_rms_db` / `rms_envelope_control`: per-latent-frame RMS, causal by construction (frame *t* sees nothing after sample `(t+1)·4096`), in [0, 1] from a −80 dBFS floor; padding on the target side forces the control to 0.
+- `scripts/pre_encode_dataset.py --features <key>` — the `__features__` hook planned in 3.4: frame-rate tensors fused into the same `{id}_controls.npy` after the `--controls` latents, cropped/padded to the latent length; sidecar JSON gains `control_keys` + `controls_dim`. Refuses to combine with `--augment_variants > 1`. `SampleDataset` unpacks `__features__` like `__audio__` (minus the pad/crop).
+- `scripts/pre_encode_dataset.py --num_shards/--shard_index` — one process per GPU, defaulting from the srun step; shards take interleaved global batch indices so ids and files are those of a single-GPU run; per-shard `_skipped.shard<k>of<N>.json` merged into `_skipped.json`. Checked on two real tracks against a single-process run: controls and 3 of 4 latents bit-identical, the 4th differs only by the pre-existing random `PhaseFlipper` (p = 0.5) that `SampleDataset` applies to the target at load time (see Notes).
+- Configs `dataset2preencoding/wjd_stems_{train,validation}.json` (four entries, one per target dir → `preencoded/<split>/{bass,other,piano,guitar}/`) and `preencoded/wjd_stems_{train,validation}_preencoded.json` (`controls: ["drums_rms"], controls_dim: [1]`, crop 144, random crop on train). `sbatch/03_3_preencode_wjd.sbatch`.
+
+**Still to do before a finetune:** (1) run the pre-encode (sbatch above, ~2 GPU-h); (2) generalise `_add_streamgen_conditioning` in `stable_audio_3/training/diffusion.py` — it hardcodes the `streamgen_latent` id, so `drums_rms` never reaches the model until it loops over `modular_local_cond_ids` instead; (3) a `small_music_wjd_drums.json` model config with `{"id": "drums_rms", "dim": 1}`; (4) the wiring table below.
 
 ## Question
 
@@ -10,7 +35,9 @@ the target**, be fed from the WJD with the *smallest possible change*, and does 
 finetune support claims 1 (drum latent is a usable condition) and 2 (the prompt selects the
 stem)?
 
-## Design decision: segment-level items, cut before pre-encoding
+## Original plan (2026-09-22) — kept for reference; see the decisions table above for what changed
+
+### Design decision: segment-level items, cut before pre-encoding *(superseded: whole tracks)*
 
 `pre_encode_dataset.py` reads every file from sample 0 with a fixed `--sample_size` and
 `random_crop=False`, and every `__audio__` control is cut identically — that discipline is
@@ -26,23 +53,29 @@ no `--pad`; 380 s cap, padding mask covers the rest) and crop to `latent_crop_le
 with `random_crop: true` at train time, so a 90 s solo yields a different 13.3 s window every
 epoch instead of its first 13.3 s.
 
-## Layout: `wjd-stem-mirror`
+### Layout: `wjd-stem-mirror` *(as built 2026-10-01)*
 
 ```
-/data/hai-res/shared/snnithya/sao-3/data/wjd/wjd-stem-mirror/<split>/tracks/
-  drums/<Track>__<seg>/drums.flac              <- condition   (Slakh's mirror had drums as the target)
-  targets/<Track>__<seg>/bass.flac             <- one item each
-  targets/<Track>__<seg>/other.flac
-  targets/<Track>__<seg>/piano.flac            (if 3.2 keeps 6s stems)
-  meta/<Track>__<seg>.json                     {track, label, start, end (track time), soloists, backing,
-                                                melids overlapping, style, rhythmfeel, avgtempo, key, decade}
+/data/hai-res/shared/snnithya/sao-3/data/wjd/wjd-stem-mirror/
+  splits.json, _skipped.json
+  <split>/tracks/drums/<Track>/drums.flac      <- condition   (Slakh's mirror had drums as the target)
+  <split>/tracks/bass/<Track>/bass.flac        <- one item each; a dataset entry per instrument dir
+  <split>/tracks/other/<Track>/other.flac
+  <split>/tracks/piano/<Track>/piano.flac
+  <split>/tracks/guitar/<Track>/guitar.flac    (only where the stem is above the floor)
+  <split>/meta/<Track>.json                    {prompts per stem, lineup + parsed players, front_line, decade,
+                                                solos (melid, instrument, style, feel, tempo, key, solostart_sec),
+                                                alignment offset, jsd_segments in track AND file time, stem levels}
+  <split>/report.html                          listening page (python -m http.server in the split dir)
 ```
 
-The dataset `path` points at `targets/`. `scripts/wjd/make_stem_mirror.py` builds the tree from
-`stems/` + `alignment.json` + JSD + `wjazzd.db`, writes the split lists, and runs
-`check_streamgen_alignment.py`-style lag checks between each target and its drums.
+Per-instrument directories rather than one `targets/` dir, so this is the Slakh layout one to
+one and a single instrument can be trained on by pointing at its directory. The planned
+segment-level `<Track>__<seg>` items were dropped (whole tracks); the segments live in `meta/`.
+Lag checks between target and drums are unnecessary here: every stem comes out of one
+separator pass with the mix's exact frame count (asserted in `separate.py`).
 
-## `custom_md_wjd.py` (new, mirrors `custom_md_slakh_streamgen.py`)
+### `custom_md_wjd.py` (new, mirrors `custom_md_slakh_streamgen.py`) *(built; prompt rules simplified to the decisions table)*
 
 For a target file, read its `meta/` JSON and return:
 
@@ -68,14 +101,14 @@ per item, so the pre-encoded-stage module must **read the prompt back from the s
 not recompute it from a path. Check what `PreEncodedDataset` exposes to the metadata fn before
 assuming.
 
-## Splits
+### Splits *(superseded: by track, seed 0, 12 %)*
 
 Not by track: tracks from one session share a band and a room sound. **Split by record
 (album), stratified by soloist instrument and decade**; ~12 % of records to validation, and
 check every major instrument has validation items. Hold out 6 whole tracks as fixed demo
 material. Commit the split as a small JSON; seed recorded.
 
-## Configs and model
+### Configs and model *(written; control is `drums_rms` dim 1, not `drums_latent` 256 — see decisions)*
 
 - `dataset2preencoding/wjd_stems_{train,validation}.json` — `controls: ["drums_audio"]`,
   `sanity_check_samples`, level gates as in Slakh (`--silence_threshold_db -50`; revisit
@@ -90,6 +123,12 @@ material. Commit the split as a small JSON; seed recorded.
   a rename is free.
 
 ## Wiring validation (same table as 1.1, before any GPU-hours)
+
+Unit-level checks done 2026-10-01 (`tests/test_wjd_metadata.py`): prompt per stem and per
+lineup; `other` rejected for a trio; drums silent → reject; feature length = latent frame
+count, 0 over target padding; causality of the RMS; fused sidecar = `[256-ch latent | 1-ch
+RMS]` in `--controls`,`--features` order with a fake autoencoder; features + augmentation
+refused. The table below is the data-level pass that still has to run on real latents.
 
 | Check | Pass condition |
 |---|---|
@@ -128,3 +167,17 @@ Stems already counted in 3.2. Latents: 256 ch × 10.77 Hz × fp16 ≈ 5.5 kB/s �
   configs, the model config, `sbatch/03_3_*.sbatch`
 - `tests/test_wjd_metadata.py` (prompt mapping, rejections, control attachment) on a tiny fixture
 - wiring table and finetune results here
+
+## Notes
+
+- **Pre-encoding is not deterministic, by upstream design.** `SampleDataset.__init__` hard-wires
+  `self.augs = Sequential(PhaseFlipper())`, a p = 0.5 polarity inversion applied to the *target*
+  at load time, and the pre-encode script uses that dataset. So half the stored target latents
+  encode `-x` rather than `x`, decided per item per run, and a re-encode reproduces ids and
+  controls but not latent values (found 2026-10-01 comparing a single-process run with a sharded
+  one: 3 of 4 latents bit-identical, the 4th decoded to the source with correlation −0.99).
+  `__audio__` controls are *not* flipped (they only go through pad/crop), so a drum-latent
+  control and its target can have opposite polarity; the RMS feature is polarity-blind. The
+  Slakh encodes in experiment 01 have the same property. Whether to disable the flipper for
+  pre-encoding is an open call — it is a legitimate augmentation, but frozen at one roll per
+  item it is just noise in the data rather than an augmentation.

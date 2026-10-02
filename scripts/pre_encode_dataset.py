@@ -81,6 +81,27 @@ so a frozen-latent dataset still shows the model a range of keys and tempos:
   while still transposing the controls. Each variant is a fresh pass over the dataset, so
   anything stochastic in the custom_metadata_module (the streamgen stem submix, for one) is
   re-rolled per variant as well.
+
+Feature controls — low-dimensional signals already on the latent frame grid:
+  uv run python scripts/pre_encode_dataset.py --dataset_config ... --features drums_rms
+
+  A `--controls` key is audio the metadata module returns under '__audio__', and it is
+  VAE-encoded into 256 channels per frame. A `--features` key is a [C, T_frames] tensor the
+  module returns under '__features__' (see stable_audio_3/data/features.py), one value per
+  latent frame, written into the SAME fused {id}_controls.npy sidecar after the audio
+  controls — channel order is `--controls` then `--features`, and the training config's
+  controls/controls_dim must list them in that order. Features are cropped or zero-padded to
+  the latent length; they are not level-checked here (the module gates them) and cannot be
+  augmented (time-stretching a frame-rate signal is not implemented), so --augment_variants
+  must stay at 1 when any are requested.
+
+Multi-GPU — one process per GPU, each encoding a shard of the batches:
+  srun --ntasks=4 --gpus-per-task=1 python scripts/pre_encode_dataset.py --dataset_config ...
+
+  Shard count and index default from the srun step (or pass --num_shards/--shard_index). The
+  shards take interleaved *global* batch indices, so the latent ids and files are exactly
+  those of a single-GPU run; only shard 0 writes sanity-check wavs; each shard writes its own
+  `_skipped.shard<k>of<N>.json` and the merged `_skipped.json` is rebuilt as each finishes.
 """
 
 import argparse
@@ -132,12 +153,16 @@ def load_custom_metadata_module(module_path: str) -> ModuleType:
     return mod
 
 
-def write_sanity_wavs(ae, out_dir, latent_id, source_audio, latent, control_audio, control_latents):
+def write_sanity_wavs(
+    ae, out_dir, latent_id, source_audio, latent, control_audio, control_latents, features=None
+):
     """Round-trip one encoded item back to audio so it can be listened to.
 
     Writes the exact tensor that went into the encoder next to the decode of the
     latent that came out, plus the same pair for every control stream. This is
-    the listening counterpart to scripts/check_streamgen_alignment.py.
+    the listening counterpart to scripts/check_streamgen_alignment.py. Feature
+    controls have no audio to decode; they are written as `{id}_feature_{key}.npy`
+    so they can be plotted against the decoded audio.
     """
     os.makedirs(out_dir, exist_ok=True)
     sr = ae.sample_rate
@@ -159,6 +184,9 @@ def write_sanity_wavs(ae, out_dir, latent_id, source_audio, latent, control_audi
             ctrl_decoded = ae.decode(ctrl_latent.unsqueeze(0)).squeeze(0)
         save(f"control_{key}_decoded", ctrl_decoded)
         save(f"control_{key}_source", control_audio[key], length=ctrl_decoded.shape[-1])
+
+    for key, feat in (features or {}).items():
+        np.save(os.path.join(out_dir, f"{latent_id}_feature_{key}.npy"), feat.detach().float().cpu().numpy())
 
 
 def latent_id_for(nb, i, variant, variants):
@@ -231,12 +259,29 @@ def encode_dataset(ae, data_dir, output_path, custom_metadata_fn, args):
         # downstream could tell that copy from real data.
         resample_on_reject=False,
     )
+    # Sharding: several processes (one per GPU) can split one encode between them. Every
+    # process enumerates the same global batch list and takes the batches whose index is its
+    # own modulo num_shards, so the latent ids -- which are built from the batch index -- come
+    # out identical to a single-process run and no two shards ever write the same file. The
+    # selection is done in the batch sampler, not by skipping inside the loop, so a shard never
+    # pays to load (or run the metadata fn on) a batch it is not going to encode.
+    num_shards = max(1, getattr(args, "num_shards", None) or 1)
+    shard_index = getattr(args, "shard_index", None) or 0
+    if not 0 <= shard_index < num_shards:
+        raise ValueError(f"shard_index {shard_index} out of range for num_shards {num_shards}")
+    n_items = len(dataset)
+    all_batches = [
+        list(range(start, min(start + args.batch_size, n_items)))
+        for start in range(0, n_items, args.batch_size)
+    ]
+    my_batches = [(nb, idxs) for nb, idxs in enumerate(all_batches) if nb % num_shards == shard_index]
+    if num_shards > 1:
+        print(f"Shard {shard_index}/{num_shards}: {len(my_batches)} of {len(all_batches)} batches")
+
     loader = torch.utils.data.DataLoader(
         dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
+        batch_sampler=[idxs for _, idxs in my_batches],
         num_workers=min(4, os.cpu_count() or 1),
-        drop_last=False,
         collate_fn=collation_fn,
     )
 
@@ -246,7 +291,16 @@ def encode_dataset(ae, data_dir, output_path, custom_metadata_fn, args):
     sanity_dir = args.sanity_check_dir or os.path.join(output_path, "_sanity_check")
 
     control_keys = list(args.controls or [])
+    feature_keys = list(getattr(args, "features", None) or [])
+    overlap = set(control_keys) & set(feature_keys)
+    if overlap:
+        raise ValueError(f"a key cannot be both a control and a feature: {sorted(overlap)}")
     variants = max(1, args.augment_variants or 1)
+    if feature_keys and variants > 1:
+        raise ValueError(
+            "--augment_variants > 1 is not supported together with --features: feature controls "
+            "are computed on the latent frame grid and are not re-timed by the time stretch."
+        )
     rate_range = tuple(args.augment_time_stretch)
     silence_threshold_db = None if args.no_silence_filter else args.silence_threshold_db
     max_silence_fraction = None if args.no_silence_filter else args.max_silence_fraction
@@ -283,7 +337,12 @@ def encode_dataset(ae, data_dir, output_path, custom_metadata_fn, args):
             silence_audio = silence_audio.half()
         with torch.no_grad():
             silence_latent = ae.encode(silence_audio, ae.sample_rate)
-        np.save(silence_path, silence_latent.cpu().numpy())
+        # Shards race to create this with identical content; write-then-rename so a reader
+        # never sees a half-written file.
+        # (np.save appends .npy to any name that lacks it, so the temp name must end in it.)
+        tmp_path = os.path.join(output_path, f"silence.{os.getpid()}.tmp.npy")
+        np.save(tmp_path, silence_latent.cpu().numpy())
+        os.replace(tmp_path, silence_path)
 
     # Each variant is a full pass over the dataset writing a differently pitched/paced copy.
     # The pass also re-runs the custom metadata fn, so anything stochastic in there (the
@@ -293,11 +352,12 @@ def encode_dataset(ae, data_dir, output_path, custom_metadata_fn, args):
             print(f"=== Augmentation variant {variant}/{variants - 1}"
                   f"{' (unaugmented)' if variant == 0 else ''} ===")
         # Reset per variant so a listening check covers every variant, not just the first.
-        sanity_remaining = args.sanity_check_samples or 0
+        # Only shard 0 writes them, so N means N items whatever the shard count.
+        sanity_remaining = (args.sanity_check_samples or 0) if shard_index == 0 else 0
         skipped = {}
         written = 0
 
-        for nb, (audio, metadata) in enumerate(loader):
+        for (nb, _), (audio, metadata) in zip(my_batches, loader):
             print(f"Processing batch {nb}")
 
             if torch.cuda.is_available():
@@ -335,6 +395,23 @@ def encode_dataset(ae, data_dir, output_path, custom_metadata_fn, args):
                     )
                 for i in keep:
                     metadata[i][key] = metadata[i][key].to(device)
+
+            for key in feature_keys:
+                missing = [i for i in keep if key not in metadata[i]]
+                if missing:
+                    raise KeyError(
+                        f"Feature '{key}' missing from metadata for {len(missing)} item(s) in batch {nb}. "
+                        f"The custom_metadata_module must return it under '__features__'."
+                    )
+                for i in keep:
+                    feat = metadata[i][key]
+                    if feat.ndim == 1:
+                        feat = feat.unsqueeze(0)
+                    if feat.ndim != 2:
+                        raise ValueError(
+                            f"Feature '{key}' must be [C, T_frames], got shape {tuple(feat.shape)}"
+                        )
+                    metadata[i][key] = feat.to(device)
 
             if variant > 0:
                 for i in keep:
@@ -420,16 +497,30 @@ def encode_dataset(ae, data_dir, output_path, custom_metadata_fn, args):
             # Control signals are encoded with the same autoencoder, so they land on the same
             # frame grid as the latents and can be cropped in lockstep at training time.
             control_latents = None
-            if control_keys:
+            if control_keys or feature_keys:
                 control_parts = []
                 for key in control_keys:
                     control_audio = torch.stack([md[key] for md in metadata], dim=0)
                     if args.model_half:
                         control_audio = control_audio.half()
                     control_parts.append(ae.encode(control_audio, ae.sample_rate))
+                # Feature controls are already per-frame; bring them onto exactly the latent
+                # length (a frames_for() count can differ from the encoder's by one at the
+                # edge) and give them the latents' dtype so they fuse into one array.
+                n_frames = latents.shape[-1]
+                for key in feature_keys:
+                    feats = []
+                    for md in metadata:
+                        feat = md[key]
+                        if feat.shape[-1] >= n_frames:
+                            feat = feat[:, :n_frames]
+                        else:
+                            feat = F.pad(feat, (0, n_frames - feat.shape[-1]))
+                        feats.append(feat)
+                    control_parts.append(torch.stack(feats, dim=0).to(latents.dtype))
                 control_dims = [p.shape[1] for p in control_parts]
                 # Fused along the channel axis; the dataset config's controls/controls_dim
-                # split it back out in this same order.
+                # split it back out in this same order: `--controls` first, then `--features`.
                 control_latents = torch.cat(control_parts, dim=1)
 
             for i, latent in enumerate(latents):
@@ -439,8 +530,9 @@ def encode_dataset(ae, data_dir, output_path, custom_metadata_fn, args):
                 md = dict(metadata[i])
 
                 # Control audio is multi-minute raw waveform; it has already been encoded into
-                # the sidecar and must not reach the JSON metadata dump below.
-                for key in control_keys:
+                # the sidecar and must not reach the JSON metadata dump below. Same for the
+                # feature tensors, which are in the sidecar too.
+                for key in control_keys + feature_keys:
                     md.pop(key, None)
                 padding_mask = (
                     F.interpolate(
@@ -466,9 +558,11 @@ def encode_dataset(ae, data_dir, output_path, custom_metadata_fn, args):
                 if control_latents is not None:
                     control_np = control_latents[i].cpu().numpy()[:, : latent_np.shape[-1]]
                     np.save(os.path.join(output_path, f"{latent_id}_controls.npy"), control_np)
-                    md["controls_dim"] = [
-                        control_latents.shape[1] // len(control_keys)
-                    ] * len(control_keys)
+                    # Named `control_keys`, not `controls`: PreEncodedDataset puts the split
+                    # tensors under info["controls"] at train time, and a list under the same
+                    # key in the JSON would only invite confusion.
+                    md["control_keys"] = control_keys + feature_keys
+                    md["controls_dim"] = control_dims
 
                 md["padding_mask"] = padding_mask.cpu().numpy().tolist()
                 for k, v in md.items():
@@ -480,10 +574,15 @@ def encode_dataset(ae, data_dir, output_path, custom_metadata_fn, args):
 
                 if sanity_remaining > 0:
                     sanity_controls = {}
+                    sanity_features = {}
                     if control_latents is not None:
                         ind = 0
-                        for key, dim in zip(control_keys, control_dims):
-                            sanity_controls[key] = control_latents[i][ind : ind + dim, : latent_np.shape[-1]]
+                        for key, dim in zip(control_keys + feature_keys, control_dims):
+                            part = control_latents[i][ind : ind + dim, : latent_np.shape[-1]]
+                            if key in control_keys:
+                                sanity_controls[key] = part
+                            else:
+                                sanity_features[key] = part
                             ind += dim
                     write_sanity_wavs(
                         ae,
@@ -493,6 +592,7 @@ def encode_dataset(ae, data_dir, output_path, custom_metadata_fn, args):
                         torch.from_numpy(latent_np).to(device),
                         {key: metadata[i][key] for key in sanity_controls},
                         sanity_controls,
+                        features=sanity_features,
                     )
                     sanity_remaining -= 1
                     if sanity_remaining == 0:
@@ -507,14 +607,45 @@ def encode_dataset(ae, data_dir, output_path, custom_metadata_fn, args):
         # job log, which on a multi-hour Slurm run is where this information otherwise dies.
         # One file for all variants, deliberately: a per-variant name would have to end in
         # `_v<N>.json`, which is exactly the glob that selects a variant's real items.
-        report_path = os.path.join(output_path, "_skipped.json")
-        report = {}
-        if os.path.exists(report_path):
-            with open(report_path) as f:
-                report = json.load(f)
-        report[f"v{variant}"] = {"written": written, "skipped": skipped}
-        with open(report_path, "w") as f:
-            json.dump(report, f, indent=2)
+        #
+        # Each shard owns `_skipped.shard<k>of<N>.json` and `_skipped.json` is the merge of
+        # whichever shard files exist, rebuilt by every shard when it finishes. The last shard
+        # to finish therefore leaves the complete merge; an unsharded run is shard 0 of 1.
+        write_skipped_report(output_path, variant, written, skipped, shard_index, num_shards)
+
+
+def _write_json_atomic(path, obj):
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f, indent=2)
+    os.replace(tmp, path)
+
+
+def write_skipped_report(output_path, variant, written, skipped, shard_index, num_shards):
+    """Record one shard's tally for a variant and refresh the merged `_skipped.json`."""
+    shard_path = os.path.join(output_path, f"_skipped.shard{shard_index}of{num_shards}.json")
+    shard_report = {}
+    if os.path.exists(shard_path):
+        with open(shard_path) as f:
+            shard_report = json.load(f)
+    shard_report[f"v{variant}"] = {"written": written, "skipped": skipped}
+    _write_json_atomic(shard_path, shard_report)
+
+    merged = {}
+    for name in sorted(os.listdir(output_path)):
+        if not (name.startswith("_skipped.shard") and name.endswith(f"of{num_shards}.json")):
+            continue
+        with open(os.path.join(output_path, name)) as f:
+            part = json.load(f)
+        for key, tally in part.items():
+            entry = merged.setdefault(key, {"written": 0, "skipped": {}, "shards": 0})
+            entry["written"] += tally["written"]
+            for reason, count in tally["skipped"].items():
+                entry["skipped"][reason] = entry["skipped"].get(reason, 0) + count
+            entry["shards"] += 1
+    for entry in merged.values():
+        entry["shards"] = f"{entry['shards']}/{num_shards}"
+    _write_json_atomic(os.path.join(output_path, "_skipped.json"), merged)
 
 
 def load_config(config_path: str) -> dict:
@@ -538,6 +669,9 @@ def merge_config_into_args(args, cfg: dict, parser: argparse.ArgumentParser):
         "pad",
         "output_path",
         "controls",
+        "features",
+        "num_shards",
+        "shard_index",
         "sanity_check_samples",
         "sanity_check_dir",
         "augment_variants",
@@ -642,6 +776,29 @@ if __name__ == "__main__":
             "'controls'/'controls_dim' in the training dataset config."
         ),
     )
+    parser.add_argument(
+        "--features",
+        nargs="*",
+        default=None,
+        help=(
+            "Metadata keys holding frame-rate feature tensors [C, T_frames] (returned by the "
+            "custom_metadata_module under '__features__', e.g. drums_rms) to write into the same "
+            "fused {id}_controls.npy sidecar, after the --controls latents. Cropped/padded to the "
+            "latent length, not VAE-encoded, not level-checked, not augmentable."
+        ),
+    )
+    parser.add_argument(
+        "--num_shards",
+        type=int,
+        default=None,
+        help=(
+            "Split the encode between this many processes (one per GPU); each takes the batches "
+            "whose global index == shard_index mod num_shards, so ids match an unsharded run. "
+            "Defaults from the Slurm step (SLURM_STEP_NUM_TASKS / SLURM_PROCID) when launched "
+            "with srun --ntasks=N, else 1."
+        ),
+    )
+    parser.add_argument("--shard_index", type=int, default=None, help="This process's shard, 0-based.")
     parser.add_argument(
         "--sanity_check_samples",
         type=int,
@@ -769,6 +926,17 @@ if __name__ == "__main__":
         args.silence_threshold_db = DEFAULT_SILENCE_THRESHOLD_DB
     if args.silence_frame_threshold_db is None:
         args.silence_frame_threshold_db = DEFAULT_SILENCE_FRAME_DB
+
+    # Sharding defaults from the srun step, so `srun --ntasks=4 python pre_encode_dataset.py ...`
+    # just works; explicit flags win. Only the *step* variables are consulted -- SLURM_NTASKS
+    # alone is also set in a plain sbatch shell and would not mean "I am one of several".
+    step_tasks = int(os.environ.get("SLURM_STEP_NUM_TASKS") or 0)
+    if args.num_shards is None:
+        args.num_shards = step_tasks if step_tasks > 1 else 1
+    if args.shard_index is None:
+        args.shard_index = int(os.environ.get("SLURM_PROCID") or 0) if args.num_shards > 1 else 0
+    if args.num_shards > 1:
+        print(f"Sharded run: this is shard {args.shard_index} of {args.num_shards}")
 
     if not args.pad and args.batch_size > 1:
         parser.error(
