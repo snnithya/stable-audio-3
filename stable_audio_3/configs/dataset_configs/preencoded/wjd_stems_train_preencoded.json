@@ -3,12 +3,25 @@
     "datasets": [
         {
             "id": "wjd-stems-train",
-            "path": ["/data/hai-res/shared/snnithya/sao-3/data/wjd/preencoded/train/bass", "/data/hai-res/shared/snnithya/sao-3/data/wjd/preencoded/train/other", "/data/hai-res/shared/snnithya/sao-3/data/wjd/preencoded/train/piano", "/data/hai-res/shared/snnithya/sao-3/data/wjd/preencoded/train/guitar"]
+            "path": [
+                "/data/hai-res/shared/snnithya/sao-3/data/wjd/preencoded/train/bass",
+                "/data/hai-res/shared/snnithya/sao-3/data/wjd/preencoded/train/other",
+                "/data/hai-res/shared/snnithya/sao-3/data/wjd/preencoded/train/piano",
+                "/data/hai-res/shared/snnithya/sao-3/data/wjd/preencoded/train/guitar"
+            ]
         }
     ],
     "latent_crop_length": 144,
     "random_crop": true,
-    "controls": ["drums_rms"],
-    "controls_dim": [1],
-    "_comment": "WJD stem mirror, train split, pre-encoded from dataset2preencoding/wjd_stems_train.json. No custom_metadata_module: the prompt was written into each sidecar JSON at pre-encode time by custom_md_wjd.py and PreEncodedDataset passes it through as info['prompt']. Whole tracks were encoded, so 'latent_crop_length' 144 (13.3 s) with 'random_crop' picks a different window of each track every epoch; the drums_rms control is cropped in lockstep by PreEncodedDataset. 'controls'/'controls_dim' must match control_keys/controls_dim in the sidecar JSONs (--controls first, then --features at pre-encode). NOTE: the training wrapper (stable_audio_3/training/diffusion.py, _add_streamgen_conditioning) still hardcodes the 'streamgen_latent' control id; it has to be generalised to any modular_local_cond id before this control reaches the model."
+    "controls": [
+        "drums_rms",
+        "drums_tria_fixed",
+        "drums_tria_ema"
+    ],
+    "controls_dim": [
+        1,
+        2,
+        2
+    ],
+    "_comment": "WJD stem mirror, train split, pre-encoded from dataset2preencoding/wjd_stems_train.json. No custom_metadata_module: the prompt was written into each sidecar JSON at pre-encode time by custom_md_wjd.py and PreEncodedDataset passes it through as info['prompt']. Whole tracks were encoded, so 'latent_crop_length' 144 (13.3 s) with 'random_crop' picks a different window of each track every epoch; the controls are cropped in lockstep by PreEncodedDataset. 'controls'/'controls_dim' must list EVERY key in the sidecar, in the sidecar's order (control_keys/controls_dim in the sidecar JSONs: --controls first, then --features at pre-encode): PreEncodedDataset splits the fused array by position, not by name. The model config names the one(s) it uses (drums_rms for 3.3, drums_tria_fixed / drums_tria_ema for 3.4); the training wrapper attaches those and ignores the rest. The TRIA keys were appended to the train sidecars on 2026-10-02 with scripts/add_features_to_preencoded.py; a fresh pre-encode with WJD_CONTROL_MODE=rms,tria_fixed,tria_ema writes the same layout."
 }

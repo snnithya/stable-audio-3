@@ -11,25 +11,34 @@
 #SBATCH --output=/data/scratch-fast/snnithya/sao-3/logs/03_3_finetune_wjd_%A_%a.out
 #SBATCH --error=/data/scratch-fast/snnithya/sao-3/logs/03_3_finetune_wjd_%A_%a.out
 #
-# Experiment 3.3 -- first WJD finetune: drum RMS envelope as the control, prompt picks the stem.
-# Plan: experiments/03-wjd-jazz-stems/03-dataset-and-wiring.md.
+# Experiments 3.3 / 3.4 -- WJD finetunes: a drum feature as the control, prompt picks the stem.
+# Plans: experiments/03-wjd-jazz-stems/03-dataset-and-wiring.md, 04-onset-representation.md.
 #
-#   task 0  rms   -- small_music_wjd_drums_rms.json: 1-ch causal drum RMS as a modular local cond
-#   task 1  base  -- small_music_baseline.json: same model with no local cond (text + causal
-#                    inpainting only), the matched baseline as in 1.2. Not run by default.
+#   task 0  rms         -- small_music_wjd_drums_rms.json: 1-ch causal drum RMS (3.3)
+#   task 1  base        -- small_music_baseline.json: same model with no local cond (text +
+#                          causal inpainting only), the matched baseline as in 1.2.
+#   task 2  tria_fixed  -- small_music_wjd_drums_tria_fixed.json: 2-ch causal TRIA bands,
+#                          dataset-statistics normalisation (3.4, T1-fixed)
+#   task 3  tria_ema    -- small_music_wjd_drums_tria_ema.json: same bands, running (EMA)
+#                          normalisation (3.4, T1-ema)
 #
 #   sbatch sbatch/03_3_finetune_wjd.sbatch                # the rms run
 #   sbatch --array=0-1 sbatch/03_3_finetune_wjd.sbatch    # rms + baseline pair
+#   sbatch --array=2-3 sbatch/03_3_finetune_wjd.sbatch    # the two TRIA arms
+#
+# All arms read the same pre-encoded items; the sidecar carries every control and the
+# model config names the one its arm uses.
 #
 # Mirrors 01_2_finetune.sbatch: same pretrained small-music, same causal inpainting task,
-# same optimizer, same seed. Items are whole-track latents cropped to 144 frames (13.3 s)
+# same optimizer, same seed. Items are 12 s chunks (130 frames; whole-track latents cropped to 144 frames (13.3 s) with the old config)
 # at a random offset each epoch; each item's prompt is its stem's instrument name(s)
 # ("upright bass", "piano", "trumpet, tenor saxophone", ...). The text conditioner is
 # frozen: the prompts vary here, unlike Slakh's constant "drums", but T5Gemma already
 # separates instrument names and the DiT's cross-attention is what has to learn to use
 # them. Drop --freeze_conditioner to test the alternative.
 #
-# Prerequisite: 03_3_preencode_wjd.sbatch has finished for the train split.
+# Prerequisite: 03_3_preencode_wjd.sbatch has finished for the train split (chunked, the
+# default there, into .../wjd/preencoded-chunked/train/).
 
 set -euo pipefail
 
@@ -38,7 +47,7 @@ export HF_HOME=/data/hai-res/snnithya/.cache/huggingface
 # This experiment lives on tap-dance-expt in the sa3-tap checkout, not on v/r.
 REPO=/data/hai-res/snnithya/sa3-tap/stable-audio-3
 branch=tap-dance-expt
-SAVE_ROOT=/data/scratch-fast/snnithya/sao-3/ft_checkpoints/03-3-wjd-drums-rms
+SAVE_BASE=/data/scratch-fast/snnithya/sao-3/ft_checkpoints
 mkdir -p /data/scratch-fast/snnithya/sao-3/logs
 
 SAO_REF=${SAO_REF:-$(git -C "$REPO" rev-parse HEAD)}
@@ -57,13 +66,22 @@ cd "$WORKDIR/stable-audio-3"
 PYTHON="$REPO/.venv/bin/python"
 export PYTHONPATH="$PWD"
 
-ARMS=(rms base)
+# Chunked encode by default (2026-10-02); DATASET_CONFIG=.../wjd_stems_train_preencoded.json
+# selects the earlier whole-track one.
+DATASET_CONFIG=${DATASET_CONFIG:-stable_audio_3/configs/dataset_configs/preencoded/wjd_stems_train_chunked_preencoded.json}
+
+ARMS=(rms base tria_fixed tria_ema)
 CONFIGS=(
     stable_audio_3/configs/model_configs/small_music_wjd_drums_rms.json
     stable_audio_3/configs/model_configs/small_music_baseline.json
+    stable_audio_3/configs/model_configs/small_music_wjd_drums_tria_fixed.json
+    stable_audio_3/configs/model_configs/small_music_wjd_drums_tria_ema.json
 )
+GROUPS_=(03-3-wjd-drums-rms 03-3-wjd-drums-rms 03-4-wjd-tria 03-4-wjd-tria)
 ARM=${ARMS[$SLURM_ARRAY_TASK_ID]}
 MODEL_CONFIG=${CONFIGS[$SLURM_ARRAY_TASK_ID]}
+GROUP=${GROUPS_[$SLURM_ARRAY_TASK_ID]}
+SAVE_ROOT=${SAVE_BASE}/${GROUP}
 
 echo "host=$(hostname) arm=${ARM} config=${MODEL_CONFIG} ref=${SAO_REF} started=$(date -Is)"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
@@ -71,7 +89,7 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 "$PYTHON" scripts/train_finetune.py \
     --model small-music \
     --model_config "${MODEL_CONFIG}" \
-    --dataset_config stable_audio_3/configs/dataset_configs/preencoded/wjd_stems_train_preencoded.json \
+    --dataset_config "${DATASET_CONFIG}" \
     --steps 20000 \
     --batch_size 8 \
     --accum_batches 2 \
@@ -85,7 +103,7 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
     --export_safetensors \
     --logger wandb \
     --project sao-3 \
-    --group 03-3-wjd-drums-rms \
+    --group "${GROUP}" \
     --name "wjd-${ARM}" \
     --save_dir "${SAVE_ROOT}/${ARM}"
 

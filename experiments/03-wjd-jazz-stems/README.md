@@ -148,7 +148,7 @@ bpm"`). Which template helps is a sub-question of 3.3, not a decision to make no
 | 3.1 | [Audio acquisition + alignment](01-audio-acquisition.md) | How do we get the 340 recordings, and how do we know each file is the right take at the right offset? | **planned — needs a decision on the acquisition route** |
 | 3.2 | [Source separation](02-source-separation.md) | Which separator gives usable drums (condition) and bass/piano/horn (targets) on 1940s–90s jazz, and how bad is the `other` stem as a horn stem? | planned |
 | 3.3 | [Dataset build + wiring + first finetune](03-dataset-and-wiring.md) | Whole-track mirror, prompts, pre-encode, and the first drum-conditioned finetune that tests claims 1 and 2 | **mirror built + wiring unit-tested 2026-10-01**; decisions: whole tracks, split by track, control = causal drum RMS (3.4's R1) rather than the drum latent; pre-encode + finetune not run |
-| 3.4 | [Drum onset representation](04-onset-representation.md) | Does a symbolic drum control (onset/activation channels) work as well as the drum latent? | planned, after 3.3 |
+| 3.4 | [Drum onset representation](04-onset-representation.md) | Does a symbolic drum control work as well as the drum latent / RMS? | **causal TRIA two-band control built + tested 2026-10-02** (2 ch at the latent rate; `fixed` and `ema` normalisation arms prepared); onset/activation representations still planned |
 | 3.5 | [Annotation access](05-annotation-access.md) | One module that gives chords / form / chorus / beats in *audio* time for any track, so a future experiment can condition on them | planned, low priority, no GPU |
 
 ## Results

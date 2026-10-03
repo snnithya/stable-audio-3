@@ -1,6 +1,6 @@
 # 3.3 — Dataset build, wiring, and the drum-latent finetune
 
-**Status:** **mirror built, wiring written and unit-tested** (2026-10-01); pre-encode and finetune not run
+**Status:** **mirror built, wiring written and unit-tested** (2026-10-01); whole-track pre-encode run 2026-10-01 (train), superseded by the chunked encode decided 2026-10-02 (see below); finetune not run
 **Depends on:** 3.1 (aligned audio), 3.2 (stems — done, 166 tracks, BS-Roformer-SW).
 
 ## Decisions 2026-10-01 (Nithya)
@@ -32,6 +32,41 @@ Taken before the build; they override the original plan below where the two diff
 - `model_configs/small_music_wjd_drums_rms.json` — `small_music_streamgen.json` with `{"id": "drums_rms", "dim": 1}` in place of the 256-ch accompaniment; nothing else changed, so the run is comparable to 1.2.
 - `sbatch/03_3_finetune_wjd.sbatch` — task 0 = the rms run (`small-music`, 20k steps, batch 8 × accum 2, lr 1e-5, seed 42, conditioner frozen, causal inpainting task with `future_visibility [-4, 0]` as in 1.2); task 1 = text-only baseline (`small_music_baseline.json`), not run by default.
 - Smoke-tested on the real train latents (bass/other/piano written, guitar partial): 4 steps at batch 2 plus one demo round at cfg 4 ran end to end with `drums_rms` in every batch's conditioning (a missing control raises).
+
+**Encode redone as chunks (decided 2026-10-02, Nithya):** the whole-track encode above caps
+every track at 380 s (`--sample_size 16760832`, inherited from the whole-track Slakh setting
+and equal to the model's maximum length) and samples uniformly per *track* rather than per
+second, and its silence gate is per track, not per window. Nithya wants fixed-length
+overlapping chunks as in sat-zenon's `ChunkedSampleDataset`, so:
+
+- `pre_encode_dataset.py --chunk_seconds N [--chunk_hop_ratio 0.5]` (new `ChunkedSampleDataset`
+  in `stable_audio_3/data/dataset.py`): every file becomes one item per window; the window is
+  rounded up to whole latent frames and the hop to whole frames, so chunk starts sit on the
+  latent grid and a per-frame feature of a chunk is bit-identical to the same frames of a
+  whole-file encode (`tests/test_chunked_preencode.py`). Only the window is read from disk.
+  Sidecars carry `chunk_index`, `n_chunks`, `chunk_offset`, `chunk_offset_seconds`,
+  `chunk_samples`. `custom_md_wjd.py` and `custom_md_slakh_streamgen.py` read their control
+  audio at `chunk_offset`. The silence gate now applies per window. No cap.
+- `sbatch/03_3_preencode_wjd.sbatch` defaults to `CHUNK_SECONDS=12` (Nithya's choice; the
+  script rounds it up to 130 frames = 12.07 s) with 50 % overlap (hop 65 frames),
+  `--pad --batch_size 8`, output `.../wjd/preencoded-chunked/<split>/`; training config
+  `preencoded/wjd_stems_<split>_chunked_preencoded.json` (`latent_crop_length 130` = the
+  window, so nothing is cropped; it has to be changed together with `CHUNK_SECONDS`).
+  `CHUNK_SECONDS=0` reproduces the whole-track encode. The finetune sbatch points at the
+  chunked config by default (`DATASET_CONFIG` overrides). Expected size: ~48 windows per
+  track at 13 s, so ~21k items / ~3 GB at 12 s; the piano dir alone scanned to 6184 windows.
+- The whole-track encode in `.../wjd/preencoded/train/` stays (its sidecars also carry the
+  3.4 TRIA controls, appended 2026-10-02 with `scripts/add_features_to_preencoded.py`).
+- **Per-song drum features** (`scripts/wjd/compute_drum_features.py`, Nithya's ask
+  2026-10-02): `tracks/drums/<Track>/drums_features.npz` holds `drums_rms`, `drums_tria_fixed`,
+  `drums_tria_ema` and the per-frame `rms_db` over the whole song; `custom_md_wjd.py`
+  (`WJD_DRUM_FEATURES=precomputed`, default) slices frames `[chunk_offset/4096, …)` per item and
+  reads the silence gate from `rms_db`, touching no drum audio. `drums_rms` is bit-identical to
+  the per-window computation; the TRIA controls are *better* this way: no crossover start-up
+  transient in a chunk's first frame, and the EMA statistics carry the song's history into the
+  chunk as a live stream would, instead of restarting from the prior per chunk.
+  `WJD_DRUM_FEATURES=audio` keeps the per-window computation. The pre-encode sbatch runs the
+  script (skipping existing files) before the encode. `tests/test_drum_features_precompute.py`.
 
 **Still to do:** the wiring table below on the real latents (step-0 no-op, gradient reaches the control, alignment by listening), then the finetune and its evaluation. Open knobs: conditioner frozen vs trainable (prompts vary here, unlike Slakh); demos cannot yet play the conditioning drums, since the RMS control is not decodable — a demo-side lookup of `tracks/drums/<track>/drums.flac` at `latent_crop_start` would fix that.
 

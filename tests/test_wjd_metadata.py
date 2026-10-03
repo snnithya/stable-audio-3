@@ -28,6 +28,7 @@ REPO = Path(__file__).resolve().parents[1]
 MIRROR_SCRIPT = REPO / "scripts/wjd/make_stem_mirror.py"
 MD_MODULE = REPO / "stable_audio_3/configs/dataset_configs/custom_metadata/custom_md_wjd.py"
 PRE_ENCODE = REPO / "scripts/pre_encode_dataset.py"
+DRUM_FEATURES = REPO / "scripts/wjd/compute_drum_features.py"
 
 SR = 44100
 
@@ -181,6 +182,22 @@ def _write(path, audio):
     torchaudio.save(str(path), audio, SR)
 
 
+FIXTURE_STATS = None  # set lazily: a TriaStats for the fixture drums (100 Hz tone < 200 Hz split)
+
+
+def fixture_stats():
+    from stable_audio_3.data.features import TriaStats
+
+    return TriaStats(split_hz=200.0, band_mean_db=[-40.0, -40.0], band_std_db=[10.0, 10.0])
+
+
+def write_song_features(drums_path):
+    """What scripts/wjd/compute_drum_features.py writes next to a drum stem."""
+    df = load(DRUM_FEATURES, "compute_drum_features")
+    feats, meta = df.compute_track_features(drums_path, fixture_stats())
+    df.save_features(df.features_path_for(drums_path), feats, meta)
+
+
 @pytest.fixture
 def mirror_tree(tmp_path):
     split = tmp_path / "train"
@@ -191,6 +208,8 @@ def mirror_tree(tmp_path):
     _write(tracks / "other" / "A" / "other.flac", _tone(440, 3.0))
     _write(tracks / "drums" / "B" / "drums.flac", torch.zeros(2, 3 * SR))
     _write(tracks / "bass" / "B" / "bass.flac", _tone(55, 3.0))
+    for name in ("A", "B"):
+        write_song_features(tracks / "drums" / name / "drums.flac")
     (split / "meta").mkdir()
     for name in ("A", "B"):
         (split / "meta" / f"{name}.json").write_text(json.dumps({
@@ -347,6 +366,7 @@ def four_track_tree(mirror_tree):
     split = mirror_tree
     for name in ("C", "D"):
         _write(split / "tracks" / "drums" / name / "drums.flac", _tone(90, 2.0))
+        write_song_features(split / "tracks" / "drums" / name / "drums.flac")
         _write(split / "tracks" / "bass" / name / "bass.flac", _tone(60, 2.0))
         (split / "meta" / f"{name}.json").write_text(json.dumps({
             "track": name, "prompts": {"bass": "upright bass"}, "decade": "1950s",
@@ -394,3 +414,119 @@ def test_shard_index_out_of_range_is_refused(md, mirror_tree, tmp_path):
     with pytest.raises(ValueError, match="shard_index"):
         pe.encode_dataset(FakeAE(), str(mirror_tree / "tracks" / "bass"), str(tmp_path / "x"),
                           md.get_custom_metadata, _preencode_args(num_shards=2, shard_index=2))
+
+
+# ---------------------------------------------------------------------------
+# TRIA control modes (experiment 3.4) and adding features to an encoded dataset
+# ---------------------------------------------------------------------------
+
+ADD_FEATURES = REPO / "scripts/add_features_to_preencoded.py"
+
+
+def _stats_file(tmp_path):
+    from stable_audio_3.data.features import TriaStats
+
+    path = tmp_path / "tria_stats.json"
+    TriaStats(split_hz=200.0, band_mean_db=[-40.0, -40.0], band_std_db=[10.0, 10.0]).save(path)
+    return path
+
+
+def test_module_control_mode_parsing(md):
+    assert md.parse_control_mode("both") == ("rms", "audio")
+    assert md.parse_control_mode("tria_ema, rms") == ("rms", "tria_ema")
+    assert md.parse_control_mode("rms,tria_fixed,tria_ema") == ("rms", "tria_fixed", "tria_ema")
+    with pytest.raises(ValueError):
+        md.parse_control_mode("tria")
+    with pytest.raises(ValueError):
+        md.parse_control_mode("")
+
+
+def test_module_tria_modes_return_two_channel_features(mirror_tree, tmp_path, monkeypatch):
+    monkeypatch.setenv("WJD_CONTROL_MODE", "rms,tria_fixed,tria_ema")
+    monkeypatch.setenv("WJD_TRIA_STATS", str(_stats_file(tmp_path)))
+    mod = load(MD_MODULE, "custom_md_wjd_tria")
+    target = mirror_tree / "tracks" / "bass" / "A" / "bass.flac"
+    total, valid = 4 * SR, 3 * SR
+    out = mod.get_custom_metadata(_info(target, total, valid), None)
+    feats = out["__features__"]
+    assert list(feats) == ["drums_rms", "drums_tria_fixed", "drums_tria_ema"]
+    assert feats["drums_tria_fixed"].shape == (2, frames_for(total))
+    assert feats["drums_tria_ema"].shape == (2, frames_for(total))
+    assert "__audio__" not in out
+    first_pad = frames_for(valid)
+    for feat in feats.values():
+        assert torch.all(feat[:, first_pad:] == 0)
+    # The fixture drums are a 100 Hz tone, below the 200 Hz split: low band hot, high band cold.
+    assert feats["drums_tria_fixed"][0, 1] > feats["drums_tria_fixed"][1, 1]
+    assert feats["drums_tria_ema"][0, 1] > feats["drums_tria_ema"][1, 1]
+
+
+def test_module_rms_mode_needs_no_stats_file(mirror_tree, monkeypatch):
+    monkeypatch.setenv("WJD_TRIA_STATS", "/nonexistent/tria_stats.json")
+    monkeypatch.setenv("WJD_CONTROL_MODE", "rms")
+    mod = load(MD_MODULE, "custom_md_wjd_rms_only")
+    target = mirror_tree / "tracks" / "bass" / "A" / "bass.flac"
+    out = mod.get_custom_metadata(_info(target, 4 * SR, 3 * SR), None)
+    assert list(out["__features__"]) == ["drums_rms"]
+
+
+def _fake_preencoded_item(out_dir, target, total, valid, md):
+    """A sidecar triple as pre_encode_dataset.py would write it for `target`, rms control only."""
+    n_frames = frames_for(valid)  # stored at its valid length (no --pad)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    np.save(out_dir / "0000000000.npy", np.zeros((4, n_frames), dtype=np.float32))
+    rms = md.get_custom_metadata(_info(target, total, valid), None)["__features__"]["drums_rms"]
+    np.save(out_dir / "0000000000_controls.npy", rms[:, :n_frames].numpy().astype(np.float32))
+    (out_dir / "0000000000.json").write_text(json.dumps({
+        "path": str(target), "sample_rate": SR, "padding_mask": [1] * n_frames, "prompt": "upright bass",
+        "control_keys": ["drums_rms"], "controls_dim": [1],
+    }))
+    return out_dir / "0000000000.json"
+
+
+def test_add_features_appends_tria_and_verifies_rms(md, mirror_tree, tmp_path, monkeypatch):
+    target = mirror_tree / "tracks" / "bass" / "A" / "bass.flac"
+    total, valid = 4 * SR, 3 * SR
+    item = _fake_preencoded_item(tmp_path / "latents", target, total, valid, md)
+
+    monkeypatch.setenv("WJD_CONTROL_MODE", "rms,tria_fixed,tria_ema")
+    monkeypatch.setenv("WJD_TRIA_STATS", str(_stats_file(tmp_path)))
+    tria_md = load(MD_MODULE, "custom_md_wjd_tria_add")
+    add = load(ADD_FEATURES, "add_features_to_preencoded")
+
+    keys = ["drums_tria_fixed", "drums_tria_ema"]
+    dry = add.process_item(item, tria_md, total, keys, write=False)
+    assert dry["keys"] == {"drums_rms": "verified", "drums_tria_fixed": "added", "drums_tria_ema": "added"}
+    assert dry["max_diff"]["drums_rms"] == 0.0
+    assert json.loads(item.read_text())["control_keys"] == ["drums_rms"]  # dry run wrote nothing
+
+    res = add.process_item(item, tria_md, total, keys)
+    assert res["written"]
+    info = json.loads(item.read_text())
+    assert info["control_keys"] == ["drums_rms", "drums_tria_fixed", "drums_tria_ema"]
+    assert info["controls_dim"] == [1, 2, 2]
+    fused = np.load(item.parent / "0000000000_controls.npy")
+    n_frames = frames_for(valid)
+    assert fused.shape == (5, n_frames) and fused.dtype == np.float32
+    expected = tria_md.get_custom_metadata(_info(target, total, valid), None)["__features__"]
+    assert np.array_equal(fused[0:1], expected["drums_rms"][:, :n_frames].numpy())
+    assert np.array_equal(fused[1:3], expected["drums_tria_fixed"][:, :n_frames].numpy())
+    assert np.array_equal(fused[3:5], expected["drums_tria_ema"][:, :n_frames].numpy())
+
+    again = add.process_item(item, tria_md, total, keys)
+    assert not again["written"]
+    assert again["keys"] == {"drums_rms": "verified", "drums_tria_fixed": "unchanged", "drums_tria_ema": "unchanged"}
+
+
+def test_add_features_refuses_to_overwrite_a_differing_key(md, mirror_tree, tmp_path, monkeypatch):
+    target = mirror_tree / "tracks" / "bass" / "A" / "bass.flac"
+    total, valid = 4 * SR, 3 * SR
+    item = _fake_preencoded_item(tmp_path / "latents", target, total, valid, md)
+    ctrl = item.parent / "0000000000_controls.npy"
+    np.save(ctrl, np.load(ctrl) * 0.5)  # a stale rms control
+    add = load(ADD_FEATURES, "add_features_to_preencoded_2")
+    res = add.process_item(item, md, total, ["drums_rms"])
+    assert res["keys"] == {"drums_rms": "mismatch"} and not res["written"]
+    res = add.process_item(item, md, total, ["drums_rms"], replace=True)
+    assert res["keys"] == {"drums_rms": "replaced"} and res["written"]
+    assert add.process_item(item, md, total, ["drums_rms"])["keys"] == {"drums_rms": "unchanged"}

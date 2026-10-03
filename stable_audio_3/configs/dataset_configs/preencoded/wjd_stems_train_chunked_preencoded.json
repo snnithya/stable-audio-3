@@ -1,0 +1,27 @@
+{
+    "dataset_type": "pre_encoded",
+    "datasets": [
+        {
+            "id": "wjd-stems-train-chunked",
+            "path": [
+                "/data/hai-res/shared/snnithya/sao-3/data/wjd/preencoded-chunked/train/bass",
+                "/data/hai-res/shared/snnithya/sao-3/data/wjd/preencoded-chunked/train/other",
+                "/data/hai-res/shared/snnithya/sao-3/data/wjd/preencoded-chunked/train/piano",
+                "/data/hai-res/shared/snnithya/sao-3/data/wjd/preencoded-chunked/train/guitar"
+            ]
+        }
+    ],
+    "latent_crop_length": 130,
+    "random_crop": false,
+    "controls": [
+        "drums_rms",
+        "drums_tria_fixed",
+        "drums_tria_ema"
+    ],
+    "controls_dim": [
+        1,
+        2,
+        2
+    ],
+    "_comment": "WJD stem mirror, train split, pre-encoded as CHUNKS by sbatch/03_3_preencode_wjd.sbatch (pre_encode_dataset.py --chunk_seconds 12 --chunk_hop_ratio 0.5 --pad, i.e. 130-frame / 12.07 s windows every 65 frames, 50 % overlap; decided 2026-10-02 over the earlier whole-track-capped-at-380-s encode in preencoded/). One item per window, every window of every track, silence-gated per window; 'latent_crop_length' 130 equals the window so nothing is cropped and 'random_crop' is moot; it MUST equal the window in frames (ceil(CHUNK_SECONDS*44100/4096)), so change it together with CHUNK_SECONDS in the sbatch. The prompt is in each sidecar JSON (custom_md_wjd.py at pre-encode time) and PreEncodedDataset passes it through. 'controls'/'controls_dim' must list EVERY key in the sidecar in its order (control_keys/controls_dim in the sidecar JSONs): PreEncodedDataset splits the fused array by position. The model config names the one(s) it uses (drums_rms for 3.3, drums_tria_fixed / drums_tria_ema for 3.4); the training wrapper attaches those and ignores the rest. Each sidecar also records chunk_index, n_chunks, chunk_offset (samples), chunk_offset_seconds and chunk_samples."
+}

@@ -71,8 +71,10 @@ uv sync --extra flash
     /data/hai-res/shared/snnithya/sao-3/data/slakh-streamgen-preencoded-same-s-wo-silence/<split>/
     Anything under .../slakh-streamgen-preencoded/ predates the fix in
     experiments/01-streamgen-conditioning/04-silence-filtering.md and contains duplicate tracks.
-  - Weimar Jazz Database (annotations only; audio not yet acquired): /data/hai-res/shared/snnithya/sao-3/data/wjd/
-    (`wjazzd.db` + JSD structure annotations; plan in experiments/03-wjd-jazz-stems/)
+  - Weimar Jazz Database: /data/hai-res/shared/snnithya/sao-3/data/wjd/
+    (`wjazzd.db` + JSD annotations; separated stems in `wjd-stem-mirror/<split>/tracks/<inst>/<Track>/`;
+    pre-encoded latents: `preencoded-chunked/<split>/` = 12 s windows (130 frames) at 50 % overlap (current, 2026-10-02),
+    `preencoded/<split>/` = whole tracks capped at 380 s (superseded); plan in experiments/03-wjd-jazz-stems/)
 - **Checkpoint / log dirs:**: /data/scratch-fast/snnithya/sao-3/
 
 ---

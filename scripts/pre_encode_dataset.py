@@ -18,6 +18,20 @@ Usage (CLI args):
 Usage (dataset config):
   uv run python scripts/pre_encode_dataset.py --dataset_config stable_audio_3/configs/dataset_configs/dataset2preencoding/local_babyslakh.json
 
+Chunking — encode every file as fixed-length overlapping windows instead of one window:
+  uv run python scripts/pre_encode_dataset.py --dataset_config ... --chunk_seconds 12 --pad --batch_size 8
+
+  --chunk_seconds N rounds N up to whole latent frames (4096 samples) and yields one item per
+  window, starting every --chunk_hop_ratio (default 0.5, i.e. 50 % overlap) of a window; a file
+  shorter than a window gives one padded item, and an uncovered tail becomes a padded last item
+  when it is at least --chunk_min_tail_fraction (default 0.5) of a window. Without it a file is
+  one item cut/padded to --sample_size from its start, so anything past --sample_size is lost.
+  Each sidecar JSON records chunk_index, n_chunks, chunk_offset (samples), chunk_offset_seconds
+  and chunk_samples; latent ids stay sequential over (file, chunk). Control audio from a
+  custom_metadata_module must be read at info["chunk_offset"] (custom_md_wjd.py and
+  custom_md_slakh_streamgen.py do), and the silence filter below then applies per window,
+  which is the point: a window on a tacet is dropped rather than trained on.
+
 Sanity check — decode the first few encoded items back to audio (source/decoded pairs,
 plus every control stream) into <output_path>/_sanity_check/ so you can listen to them:
   uv run python scripts/pre_encode_dataset.py --dataset_config ... --sanity_check_samples 3
@@ -108,6 +122,7 @@ import argparse
 import gc
 import importlib.util
 import json
+import math
 import os
 import random
 from pathlib import Path
@@ -125,10 +140,12 @@ from stable_audio_3.data.augmentation import (
     sample_augmentation_params,
 )
 from stable_audio_3.data.dataset import (
+    ChunkedSampleDataset,
     LocalDatasetConfig,
     SampleDataset,
     collation_fn,
 )
+from stable_audio_3.data.features import LATENT_HOP
 from stable_audio_3.data.utils import (
     DEFAULT_SILENCE_FRAME_DB,
     DEFAULT_SILENCE_THRESHOLD_DB,
@@ -236,17 +253,29 @@ def augment_item(audio, md, control_keys, params, pitch_controls_only):
     return audio
 
 
+def resolve_chunking(chunk_seconds, hop_ratio, sample_rate, hop=LATENT_HOP):
+    """(window samples, hop samples) for `--chunk_seconds`, both whole latent frames.
+
+    Rounding the window up to a frame keeps a chunk's latent exactly `window / hop` frames
+    long, and a hop that is a whole number of frames keeps every chunk start on the latent
+    grid, so a frame-rate feature computed per chunk is the same frame it would be in a
+    whole-file encode.
+    """
+    frames = max(1, math.ceil(chunk_seconds * sample_rate / hop))
+    hop_frames = min(frames, max(1, round(frames * hop_ratio)))
+    return frames * hop, hop_frames * hop
+
+
 def encode_dataset(ae, data_dir, output_path, custom_metadata_fn, args):
     """Encode all audio in data_dir and write latents to output_path."""
-    dataset = SampleDataset(
-        [
-            LocalDatasetConfig(
-                id="train", # dead id, shouldn't make a difference downstream
-                path=data_dir,
-                custom_metadata_fn=custom_metadata_fn,
-            )
-        ],
-        sample_size=args.sample_size,
+    configs = [
+        LocalDatasetConfig(
+            id="train", # dead id, shouldn't make a difference downstream
+            path=data_dir,
+            custom_metadata_fn=custom_metadata_fn,
+        )
+    ]
+    dataset_kwargs = dict(
         sample_rate=ae.sample_rate,
         force_channels="stereo",
         # PadCrop_Normalized_T draws a fresh offset on every call, and extra `__audio__`
@@ -259,6 +288,22 @@ def encode_dataset(ae, data_dir, output_path, custom_metadata_fn, args):
         # downstream could tell that copy from real data.
         resample_on_reject=False,
     )
+    chunk_seconds = getattr(args, "chunk_seconds", None)
+    if chunk_seconds:
+        hop_ratio = getattr(args, "chunk_hop_ratio", None) or 0.5
+        min_tail = getattr(args, "chunk_min_tail_fraction", None)
+        min_tail = 0.5 if min_tail is None else min_tail
+        window, hop_size = resolve_chunking(chunk_seconds, hop_ratio, ae.sample_rate)
+        # The window is the sample size from here on: silence latent, pad/crop of controls.
+        args.sample_size = window
+        print(f"Chunking: {window / ae.sample_rate:.3f} s windows ({window // LATENT_HOP} latent "
+              f"frames) every {hop_size / ae.sample_rate:.3f} s ({hop_size // LATENT_HOP} frames); "
+              f"tails >= {min_tail:.0%} of a window are kept, padded")
+        dataset = ChunkedSampleDataset(
+            configs, sample_size=window, hop_size=hop_size, min_tail_fraction=min_tail, **dataset_kwargs
+        )
+    else:
+        dataset = SampleDataset(configs, sample_size=args.sample_size, **dataset_kwargs)
     # Sharding: several processes (one per GPU) can split one encode between them. Every
     # process enumerates the same global batch list and takes the batches whose index is its
     # own modulo num_shards, so the latent ids -- which are built from the batch index -- come
@@ -665,6 +710,9 @@ def merge_config_into_args(args, cfg: dict, parser: argparse.ArgumentParser):
         "model",
         "batch_size",
         "sample_size",
+        "chunk_seconds",
+        "chunk_hop_ratio",
+        "chunk_min_tail_fraction",
         "model_half",
         "pad",
         "output_path",
@@ -753,6 +801,28 @@ if __name__ == "__main__":
         help="Folder to write .npy/.json latent pairs (overrides output_path from config)",
     )
     parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument(
+        "--chunk_seconds",
+        type=float,
+        default=None,
+        help=(
+            "Encode every file as overlapping windows of this many seconds (rounded up to whole "
+            "latent frames), one item each, instead of one --sample_size window per file. "
+            "See 'Chunking' above. Overrides --sample_size."
+        ),
+    )
+    parser.add_argument(
+        "--chunk_hop_ratio",
+        type=float,
+        default=0.5,
+        help="Window start spacing as a fraction of the window (default 0.5 = 50%% overlap).",
+    )
+    parser.add_argument(
+        "--chunk_min_tail_fraction",
+        type=float,
+        default=None,
+        help="Keep an uncovered tail as a padded last window when it is at least this fraction of a window (default 0.5).",
+    )
     parser.add_argument(
         "--sample_size",
         type=int,

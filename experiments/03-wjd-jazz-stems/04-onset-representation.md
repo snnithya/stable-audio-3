@@ -1,7 +1,122 @@
 # 3.4 — Drum onset representation as the condition
 
-**Status:** planned, after 3.3
-**Depends on:** 3.3 (a working drum-latent finetune to compare against)
+**Status:** **TRIA control built and unit-tested (2026-10-02)**; finetunes T1-fixed / T1-ema prepared (see the decisions below). The onset/activation representations further down are still planned.
+**Depends on:** 3.3 (the drum-RMS finetune is the reference row)
+
+## Decisions 2026-10-02 (Nithya): TRIA features first, at the latent rate
+
+Before any onset transcription, try the rhythm representation of **TRIA** ("The Rhythm In
+Anything", O'Reilly, Flores Garcia, Seetharaman, Pardo, ISMIR 2024 LBD,
+[pdf](https://oreillyp.github.io/assets/manuscript/474_lbd.pdf)) as the drum control. TRIA
+conditions a masked-token drum generator on a deliberately lossy signal at the DAC frame rate
+(hop 512, 86 Hz): an 80-bin mel spectrogram summed into **two equal-energy bands**, each
+**standardised**, passed through a **sigmoid** and **quantised to 33 levels** so timbre cannot
+leak through; at training time the input audio is randomly noised / band-passed / pitch-shifted
+/ EQ'd so beatboxing and table-tapping work at test time. It is a two-band, relatively
+normalised, coarsely quantised loudness envelope, i.e. a small generalisation of 3.3's
+`drums_rms` (one band, absolute dBFS, unquantised).
+
+| Question | Decision | Consequence |
+|---|---|---|
+| Frame grid | **The latent grid, 10.77 Hz, one value per band per frame** (S = 1). Sub-frame stacking (S = 8 → 16 ch, TRIA's native 86 Hz, 11.6 ms placement) considered and **not run** | 2 channels; the resolution problem below stays open for this control, as for `drums_rms` |
+| Normalisation | **Both**: `tria_fixed` (training-set mean/std per band) and `tria_ema` (causal running statistics) | Two arms, T1-fixed and T1-ema; T2/T3 (sub-frame variants) dropped |
+| Split frequency | Fixed corpus constant (median equal-energy frequency of the training drum stems) | Measured by `scripts/wjd/tria_feature_stats.py`, stored in `configs/dataset_configs/features/wjd_drums_tria_stats.json` |
+| Augmentations | Not in this round | TRIA's robustness augmentations matter for live beatbox/pad input; phase 2 |
+
+### Making TRIA causal
+
+Three of TRIA's steps look at the whole clip. The control in `stable_audio_3/data/features.py`
+(`tria_control`) replaces each with a causal equivalent and keeps the rest; frame *t* is a
+function of samples before `(t+1)·4096` only, the same guarantee as `block_rms_db`.
+
+| Step | In the paper | Here |
+|---|---|---|
+| Spectrogram → 2 bands | centred STFT windows (look half a window ahead), mel, adaptive split | **causal IIR crossover** (two cascaded 2nd-order Butterworth biquads per band = 4th-order Linkwitz-Riley, low + high is an allpass) at the fixed split, then the same per-frame block RMS as `drums_rms` per band (`band_rms_db`). With one band this *is* `drums_rms`. |
+| Equal-energy split | per clip, from the clip's full energy distribution | one constant for the corpus (median over training tracks of the frequency below which half the drum stem's energy lies) |
+| Standardisation | per-clip mean/std | `fixed`: training-set mean/std per band, over frames above the −80 dBFS floor (floor frames are separator dropouts/tacets, map to 0 anyway, and would only inflate the std). `ema`: mean/variance over an exponentially weighted window ending at the current frame, τ = 4 s, warm-started with the dataset statistics carrying one τ of weight so the first bars are standardised against the corpus, not against themselves (`ema_standardize`). |
+| Sigmoid, 33 levels | per frame | unchanged (`quantize_unit`) |
+| Padding | n/a | as for `drums_rms`: control audio zeroed past the target's valid length, and every frame after the last valid one forced to 0 — necessary for `ema`, whose statistics would otherwise adapt to the silence and drift back to 0.5 |
+
+What the two normalisations trade: `fixed` is deterministic and keeps absolute dynamics
+(a quiet brushes passage reads quiet), which is what a drum *stem* from the same mix supports.
+`ema` is the paper-faithful one: level-invariant after a few seconds, so a tapped or
+beatboxed input at any gain lands in the same range, at the cost of a feature that depends
+on the preceding ~4 s (a repeated bar is not an identical feature until the statistics have
+settled, and the first bar after a long tacet saturates at 1 until they recover).
+
+Latency is unchanged from the RMS control: the feature for latent frame *t* is complete the
+moment that frame's audio has arrived.
+
+### What was built (all unit-tested: `tests/test_tria_features.py`, 22 tests; `tests/test_wjd_metadata.py` +5)
+
+- `stable_audio_3/data/features.py` — `TriaStats`, `crossover`, `band_rms_db`,
+  `fixed_standardize`, `ema_standardize`, `quantize_unit`, `tria_control`.
+- `custom_md_wjd.py` — `WJD_CONTROL_MODE` is now a comma-separated set
+  (`rms,tria_fixed,tria_ema,audio`; `both` still means `rms,audio`); the TRIA modes read the
+  stats file from `WJD_TRIA_STATS` (default: the committed one). Feature keys
+  `drums_tria_fixed`, `drums_tria_ema`, 2 ch each.
+- `scripts/wjd/tria_feature_stats.py` — the two passes that produce the stats file and a
+  per-track report (`<mirror>/tria_stats/train_report.{json,npz}`).
+- `scripts/wjd/compute_drum_features.py` — all three controls (+ per-frame RMS in dB) per
+  **whole song**, next to the drum stem; the metadata module slices them per window
+  (`WJD_DRUM_FEATURES=precomputed`, default). For `tria_ema` this is the intended semantics:
+  running statistics over the song's actual history, not a restart per chunk; for `tria_fixed`
+  it removes the crossover's start-up transient in a chunk's first frame.
+- `scripts/add_features_to_preencoded.py` — appends feature keys to an existing pre-encoded
+  dataset's sidecars **without re-encoding** (which would re-roll the per-item polarity flip,
+  3.3 Notes). It recomputes every key the module returns and compares the ones already in the
+  sidecar: `drums_rms` has to come back bit-identical before a new key is trusted.
+- Configs: `model_configs/small_music_wjd_drums_tria_{fixed,ema}.json` (the rms config with
+  `{"id": "drums_tria_*", "dim": 2}`); `preencoded/wjd_stems_*_preencoded.json` now lists all
+  three sidecar keys (`controls_dim [1, 2, 2]`; PreEncodedDataset splits by position, the
+  model config names what it uses); `sbatch/03_3_finetune_wjd.sbatch` tasks 2 and 3;
+  `sbatch/03_3_preencode_wjd.sbatch` defaults to all three features.
+
+### Runs
+
+Same items, same evaluation as 3.3 (rhythmic lock, prompt selectivity, listening grid):
+
+| Run | Control | Channels | Status |
+|---|---|---|---|
+| 3.3 rms | causal drum RMS, absolute dBFS | 1 | not yet submitted |
+| T1-fixed | TRIA bands, dataset normalisation | 2 | prepared (sbatch task 2) |
+| T1-ema | TRIA bands, EMA normalisation | 2 | prepared (sbatch task 3) |
+
+One probe specific to this control once an arm is trained: lower the whole drum stem by 12 dB
+and re-generate. `fixed` should follow the level (quieter, sparser output); `ema` should not
+notice after the first seconds. That is the operational difference between the two arms.
+
+### Measured constants (training split, 136 whole drum stems; 2026-10-02)
+
+First measured on the first 380 s of each track (the whole-track encode's cap: split 198.9 Hz,
+means −47.9 / −40.9, stds 14.3 / 10.6), then re-measured on whole tracks once the encode moved
+to chunks; the numbers below are the whole-track ones and are what the stats file holds.
+
+`configs/dataset_configs/features/wjd_drums_tria_stats.json`; per-track numbers in
+`<mirror>/tria_stats/train_report.json`, per-frame band levels in `train_report.npz`.
+
+| | |
+|---|---|
+| Equal-energy frequency per track | p5 87 Hz · p25 155 · **median 198** · p75 338 · p95 4672 Hz |
+| → `split_hz` | **198.2 Hz** |
+| Tracks whose split sits above 1 kHz | 21 of 136 (old recordings with no low end, ride-dominated kits: Lacy, Hawkins, Getz, Desmond …) — for them the low band reads quiet under `fixed`, which is information, not an error |
+| Low band (< 198 Hz), frames above floor | mean **−47.7 dBFS**, std **14.3 dB**; 14.3 % of frames at the −80 dB floor |
+| High band (> 198 Hz), frames above floor | mean **−40.5 dBFS**, std **10.7 dB**; 8.4 % of frames at the floor |
+
+Floor frames are far more common than in a mixed recording: the separator outputs near-digital
+silence between hits, especially in the low band between kicks. Hence mean/std over the
+frames *above* the floor (with all frames: −52.3 / 17.4 and −43.9 / 15.0, i.e. the range the
+real dynamics get would shrink by a fifth).
+
+Level usage on real tracks (33 levels): a median track uses 26–29 levels per band under
+`fixed` and 30–32 under `ema`; no frame saturates at 1 and none sits at 0 outside padding;
+`ema` medians are 0.47–0.50 by construction, `fixed` medians 0.28–0.59 depending on the
+track's level and spectrum. Frame-to-frame the pattern of the groove is visible in both
+(alternating 0.2 / 0.5–0.8 on the low band = kick on the strong beats).
+
+---
+
+## Original 3.4 plan (2026-09-22): onset / activation representations
 
 ## Question
 

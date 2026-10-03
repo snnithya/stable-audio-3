@@ -93,8 +93,9 @@ def load_and_mix_stems(
     sample_rate,
     target_length=None,
     silence_threshold_db=SILENCE_THRESHOLD_DB,
+    offset=0,
 ):
-    """Load, level, and sum a random subset of the accompaniment stems.
+    """Load, level, and sum a random subset of the accompaniment stems, from sample ``offset``.
 
     Returns (mix, selected_names). `mix` is a stereo tensor at `sample_rate`, or None if no
     usable (non-silent) stem was found.
@@ -117,6 +118,9 @@ def load_and_mix_stems(
             audio = torchaudio.functional.resample(audio, sr, sample_rate)
 
         audio = _to_stereo(audio)
+
+        if offset:
+            audio = audio[:, offset:]
 
         if target_length is not None:
             if audio.shape[1] > target_length:
@@ -181,8 +185,8 @@ def get_custom_metadata(info, audio):
     SampleDataset applies the same pad/crop and channel handling it applied to the drums.
     That shared treatment is what keeps the two time-aligned, and it only holds when the
     dataset is built with random_crop=False — both because each call would otherwise draw its
-    own crop offset, and because the stems here are read from sample 0 (there is no offset to
-    read them from otherwise).
+    own crop offset, and because the stems here are read from the window start the dataset
+    reports (`chunk_offset` under the pre-encode's --chunk_seconds, else sample 0).
     """
     filepath = info["path"]
 
@@ -201,7 +205,10 @@ def get_custom_metadata(info, audio):
         return {"__reject__": True, "__reject_reason__": "no accompaniment stems"}
 
     mix, selected_names = load_and_mix_stems(
-        stem_paths, info["sample_rate"], target_length=target_valid_length(info, audio)
+        stem_paths,
+        info["sample_rate"],
+        target_length=target_valid_length(info, audio),
+        offset=int(info.get("chunk_offset", 0)),
     )
     if mix is None:
         return {

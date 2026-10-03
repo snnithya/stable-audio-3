@@ -1,5 +1,6 @@
 import numpy as np
 import json
+import math
 import os
 import dill
 import random
@@ -353,6 +354,144 @@ class SampleDataset(torch.utils.data.Dataset):
             return (audio, info)
         except Exception as e:
             print(f'Couldn\'t load file {audio_filename}: {e}')
+            return self[random.randrange(len(self))]
+
+
+class ChunkedSampleDataset(SampleDataset):
+    """`SampleDataset` that yields every fixed-length window of every file instead of one
+    window per file.
+
+    Each item is a `sample_size` chunk starting at a multiple of `hop_size` samples; a file
+    shorter than a chunk gives one zero-padded chunk, and a tail that a full chunk does not
+    cover becomes a padded final chunk when it is at least `min_tail_fraction` of a chunk
+    long (with a 50 % hop the uncovered tail is always shorter than that, so nothing is
+    added). Only the window is read from disk. `info` gains `chunk_index`, `n_chunks`,
+    `chunk_offset` (samples), `chunk_offset_seconds` and `chunk_samples`; a custom metadata
+    fn that loads control audio must read it from `chunk_offset`, and the pre-encode script
+    is the intended consumer (it stores the chunk fields in the sidecar JSON).
+    """
+
+    def __init__(self, configs, sample_size, hop_size, min_tail_fraction=0.5, **kwargs):
+        super().__init__(configs, sample_size=sample_size, **kwargs)
+        if hop_size <= 0 or hop_size > sample_size:
+            raise ValueError(f"hop_size must be in (0, sample_size], got {hop_size}")
+        self.sample_size = sample_size
+        self.hop_size = int(hop_size)
+        self.min_tail_fraction = min_tail_fraction
+        self.chunks = []  # (file index, chunk index, offset in samples at self.sr, n_chunks)
+        for file_idx, filename in enumerate(self.filenames):
+            n = self._duration_samples(filename)
+            offsets = self.chunk_offsets(n)
+            self.chunks.extend((file_idx, k, off, len(offsets)) for k, off in enumerate(offsets))
+        print(f"Chunked: {len(self.chunks)} chunks of {sample_size} samples (hop {self.hop_size}) "
+              f"from {len(self.filenames)} files")
+
+    def _duration_samples(self, filename):
+        meta = torchaudio.info(filename)
+        if meta.sample_rate == self.sr:
+            return meta.num_frames
+        return int(round(meta.num_frames * self.sr / meta.sample_rate))
+
+    def chunk_offsets(self, n_samples):
+        """Start offsets of the chunks covering a file of `n_samples` samples."""
+        if n_samples <= self.sample_size:
+            return [0]
+        offsets = list(range(0, n_samples - self.sample_size + 1, self.hop_size))
+        covered = offsets[-1] + self.sample_size
+        if n_samples - covered >= self.min_tail_fraction * self.sample_size:
+            offsets.append(offsets[-1] + self.hop_size)
+        return offsets
+
+    def load_window(self, filename, offset, n_samples):
+        """`[C, n]` audio from `offset` for up to `n_samples` samples, at self.sr."""
+        meta = torchaudio.info(filename)
+        if meta.sample_rate == self.sr:
+            audio, _ = torchaudio.load(filename, frame_offset=offset, num_frames=n_samples)
+            return audio
+        # Resampling: read a little more than the window in source time, resample, cut.
+        ratio = meta.sample_rate / self.sr
+        src_off = int(offset * ratio)
+        src_n = int((n_samples + 2) * ratio) + 1
+        audio, in_sr = torchaudio.load(filename, frame_offset=src_off, num_frames=src_n)
+        audio = T.Resample(in_sr, self.sr)(audio)
+        return audio[:, :n_samples]
+
+    def __len__(self):
+        return len(self.chunks)
+
+    def __getitem__(self, idx):
+        file_idx, chunk_idx, offset, n_chunks = self.chunks[idx]
+        audio_filename = self.filenames[file_idx]
+        try:
+            start_time = time.time()
+            window = self.load_window(audio_filename, offset, self.sample_size)
+            window = self.volume_norm(window)
+            n_channels, n_real = window.shape
+            total = self._duration_samples(audio_filename)
+
+            audio = torch.zeros(n_channels, self.sample_size, dtype=window.dtype)
+            audio[:, :n_real] = window
+            padding_mask = torch.zeros(self.sample_size, dtype=window.dtype)
+            padding_mask[:n_real] = 1
+
+            silent = is_silence(audio)
+            if silent and self.resample_on_reject:
+                return self[random.randrange(len(self))]
+
+            if self.augs is not None:
+                audio = self.augs(audio)
+            audio = audio.clamp(-1, 1)
+            if self.encoding is not None:
+                audio = self.encoding(audio)
+
+            info = {"path": audio_filename}
+            if silent:
+                info["__reject__"] = True
+                info["__reject_reason__"] = "peak below silence threshold"
+            for root_path in self.root_paths:
+                if root_path in audio_filename:
+                    info["relpath"] = path.relpath(audio_filename, root_path)
+            info["timestamps"] = (offset / max(total, 1), min(offset + self.sample_size, total) / max(total, 1))
+            info["seconds_start"] = math.floor(offset / self.sr)
+            info["seconds_total"] = math.ceil(total / self.sr)
+            info["chunk_index"] = chunk_idx
+            info["n_chunks"] = n_chunks
+            info["chunk_offset"] = int(offset)
+            info["chunk_offset_seconds"] = offset / self.sr
+            info["chunk_samples"] = self.sample_size
+            info["padding_mask"] = [padding_mask]
+            info["sample_rate"] = self.sr
+            info["load_time"] = time.time() - start_time
+
+            if silent:
+                return (audio, info)
+
+            for custom_md_path in self.custom_metadata_fns.keys():
+                if custom_md_path in audio_filename:
+                    custom_metadata_fn = dill.loads(self.custom_metadata_fns[custom_md_path])
+                    info.update(custom_metadata_fn(info, audio))
+
+                if "__reject__" in info and info["__reject__"]:
+                    if self.resample_on_reject:
+                        return self[random.randrange(len(self))]
+                    return (audio, info)
+
+                # Control audio comes back already cut to this chunk's window (the metadata
+                # fn reads it at `chunk_offset`); pad_crop here only pads a short one.
+                if "__audio__" in info:
+                    for audio_key, audio_value in info["__audio__"].items():
+                        audio_value, _, _, _, _, _ = self.pad_crop(audio_value)
+                        audio_value = audio_value.clamp(-1, 1)
+                        if self.encoding is not None:
+                            audio_value = self.encoding(audio_value)
+                        info[audio_key] = audio_value
+                    del info["__audio__"]
+                if "__features__" in info:
+                    info.update(info.pop("__features__"))
+
+            return (audio, info)
+        except Exception as e:
+            print(f"Couldn't load file {audio_filename} chunk {chunk_idx}: {e}")
             return self[random.randrange(len(self))]
 
 

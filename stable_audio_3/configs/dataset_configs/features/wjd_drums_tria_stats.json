@@ -1,0 +1,15 @@
+{
+  "split_hz": 198.2,
+  "band_mean_db": [
+    -47.69,
+    -40.54
+  ],
+  "band_std_db": [
+    14.28,
+    10.71
+  ],
+  "sample_rate": 44100,
+  "floor_db": -80.0,
+  "ema_tau_seconds": 30.0,
+  "source": "/data/hai-res/shared/snnithya/sao-3/data/wjd/wjd-stem-mirror/train/tracks/drums (136 tracks, whole tracks, mean/std over frames above the floor), scripts/wjd/tria_feature_stats.py"
+}
