@@ -38,6 +38,12 @@ def create_diffusion_cond_from_config(config: tp.Dict[str, tp.Any]):
     input_concat_ids = diffusion_config.get("input_concat_ids", [])
     local_add_cond_ids = diffusion_config.get("local_add_cond_ids", [])
     modular_local_cond_ids = [c["id"] for c in modular_local_cond_configs]
+    # Value a control takes when it is dropped out (training) or nulled for CFG (inference);
+    # see DiffusionCondTrainingWrapper._add_streamgen_conditioning. Controls without one use
+    # the default there.
+    modular_local_cond_null_values = {
+        c["id"]: float(c["null_value"]) for c in modular_local_cond_configs if "null_value" in c
+    }
     prepend_cond_ids = diffusion_config.get("prepend_cond_ids", [])
 
     distribution_shift_options = diffusion_config.get(
@@ -70,6 +76,7 @@ def create_diffusion_cond_from_config(config: tp.Dict[str, tp.Any]):
         input_concat_ids=input_concat_ids,
         local_add_cond_ids=local_add_cond_ids,
         modular_local_cond_ids=modular_local_cond_ids,
+        modular_local_cond_null_values=modular_local_cond_null_values,
         prepend_cond_ids=prepend_cond_ids,
         pretransform=pretransform,
         io_channels=io_channels,

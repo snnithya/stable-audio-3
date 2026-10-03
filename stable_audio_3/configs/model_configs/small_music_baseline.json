@@ -174,6 +174,7 @@
         "pre_encoded": true,
         "silence_extension_scale_seconds": 4.0,
         "cfg_dropout_prob": 0.1,
+        "inpaint_dropout_prob": 0.1,
         "mask_loss_weight": 0.2,
         "timestep_sampler": "trunc_logit_normal",
         "inpainting": {
@@ -310,5 +311,5 @@
             ]
         }
     },
-    "_comment": "Text-only twin of small_music_streamgen.json: byte-for-byte identical apart from the removal of modular_local_cond_configs. This is the 1.2 baseline arm -- same drum target, same causal inpainting task, same optimizer, only the accompaniment conditioning is gone. training.inpainting.future_visibility is kept so the mask distribution matches; with no modular conds the resulting tf_inpaint_mask is simply unused."
+    "_comment": "Text-only twin of small_music_streamgen.json: byte-for-byte identical apart from the removal of modular_local_cond_configs. This is the 1.2 baseline arm -- same drum target, same causal inpainting task, same optimizer, only the accompaniment conditioning is gone. training.inpainting.future_visibility is kept so the mask distribution matches; with no modular conds the resulting tf_inpaint_mask is simply unused. CFG dropout (2026-10-03, each drawn independently per item): prompt cfg_dropout_prob 0.1 (DiT nulls the cross-attention/prepend conds); inpaint_dropout_prob 0.1 (inpaint_masked_input set to the zero latent, inpaint_mask kept). mask_loss_weight here is NOT read by scripts/train_finetune.py, which hardcodes 1.0 (the weight of the context-reconstruction term), so change it there if you mean it. No control, so control_dropout_prob does not apply."
 }

@@ -38,6 +38,35 @@ class Profiler:
         rep += 80 * "=" + "\n\n\n"
         return rep
 
+# Unconditional token for a dropped-out control when its config entry has no `null_value`:
+# one TRIA quantisation step (1/32) above the top of the [0, 1] range every feature control
+# lives in, so it is outside the permissible values yet close to them. The 256-ch drum latent
+# has no such range (softnorm, roughly unit-variance); its config sets null_value 0, as in
+# sat-zenon, which works because the latent's zero is not the silence latent.
+CONTROL_NULL_VALUE_DEFAULT = 1.0 + 1.0 / 32
+
+
+def apply_inpaint_dropout(inpaint_masked_input, inpaint_mask, dropout_prob):
+    """CFG dropout of the inpainting context: per item, with dropout_prob, null the context's
+    values while leaving inpaint_mask as it is.
+
+    Same shape as the control dropout: the mask keeps saying where the context would be, and
+    the values under it are replaced by the null, here the zero latent (as for the streamgen
+    latent and as sat-zenon did). That is a value no real frame produces, since the
+    autoencoder's silence latent is not the zero vector, so "context nulled" (0 under a
+    visible mask) stays distinct from "no context" (FULL_MASK, 0 under a zero mask). The tf
+    mask and the controls are not touched, and the draw is independent of the control
+    dropout. Because the mask is unchanged, the loss mask built from it is unchanged too:
+    a dropped item is still scored only on the region it was asked to generate.
+    Returns (inpaint_masked_input, inpaint_mask).
+    """
+    if dropout_prob <= 0.0:
+        return inpaint_masked_input, inpaint_mask
+    drop = torch.rand(inpaint_mask.shape[0], 1, 1, device=inpaint_mask.device) < dropout_prob
+    inpaint_masked_input = torch.where(drop, torch.zeros_like(inpaint_masked_input), inpaint_masked_input)
+    return inpaint_masked_input, inpaint_mask
+
+
 class DiffusionCondTrainingWrapper(pl.LightningModule):
     '''
     Wrapper for training a conditional audio diffusion model.
@@ -54,6 +83,8 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
             optimizer_configs: dict = None,
             pre_encoded: bool = False,
             cfg_dropout_prob = 0.1,
+            control_dropout_prob: float = 0.0,
+            inpaint_dropout_prob: float = 0.0,
             timestep_sampler: tp.Literal["uniform", "logit_normal", "trunc_logit_normal", "log_snr", "log_snr_uniform"] = "uniform",
             timestep_sampler_options: tp.Optional[tp.Dict[str, tp.Any]] = None,
             validation_timesteps = [0.1, 0.3, 0.5, 0.7, 0.9],
@@ -146,6 +177,8 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
         self.silence_extension_scale_seconds = silence_extension_scale_seconds
 
         self.cfg_dropout_prob = cfg_dropout_prob
+        self.control_dropout_prob = control_dropout_prob
+        self.inpaint_dropout_prob = inpaint_dropout_prob
 
         self.rng = torch.quasirandom.SobolEngine(1, scramble=True)
 
@@ -275,7 +308,7 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
             if cid not in self.INTERNAL_LOCAL_CONDS
         ]
 
-    def _add_streamgen_conditioning(self, conditioning, metadata, tf_inpaint_mask):
+    def _add_streamgen_conditioning(self, conditioning, metadata, tf_inpaint_mask, dropout_prob: float = 0.0):
         """Attach the frame-rate controls (accompaniment latent, drum RMS, ...) to the conditioning dict.
 
         Each control is a pre-encoded signal produced alongside the audio latents and split
@@ -289,8 +322,27 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
         to the lookahead horizon, and hidden beyond it. That gating is the whole point -
         without it the model would see the future accompaniment and the condition would stop
         being causal.
+
+        dropout_prob is the CFG dropout of the control: with that probability, per item, the
+        control's values are replaced by an unconditional token, so "no control" is an input
+        the model has been trained on and can be the null branch of a control-CFG at inference.
+        The tf mask is left as it is: the token sits on the frames the mask marks visible and
+        the hidden frames stay 0, so the model can tell "unconditional" (token under a visible
+        mask) from "hidden" (0 under a zero mask) and from "silent drums" (0 under a visible
+        mask, since every feature control maps silence to 0 and the latent's zero is not
+        silence either). The token is a constant just above the control's permissible range:
+        `null_value` of the control's modular_local_cond_configs entry (the same value must be
+        used for the null at inference), CONTROL_NULL_VALUE_DEFAULT when the config has none.
+        One draw per item is shared by every control; independent of the DiT's prompt dropout.
         """
-        for cond_id in self.control_cond_ids():
+        cond_ids = self.control_cond_ids()
+        drop = None
+        if dropout_prob > 0.0 and cond_ids:
+            device = tf_inpaint_mask.device if tf_inpaint_mask is not None else self.device
+            drop = torch.rand(len(metadata), 1, 1, device=device) < dropout_prob
+        null_values = getattr(self.diffusion, "modular_local_cond_null_values", {}) or {}
+
+        for cond_id in cond_ids:
             missing = [i for i, m in enumerate(metadata) if cond_id not in m.get("controls", {})]
             if missing:
                 raise ValueError(
@@ -306,6 +358,12 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
 
             if tf_inpaint_mask is not None:
                 control = control * tf_inpaint_mask
+            if drop is not None:
+                null_value = float(null_values.get(cond_id, CONTROL_NULL_VALUE_DEFAULT))
+                null = torch.full_like(control, null_value)
+                if tf_inpaint_mask is not None:
+                    null = null * tf_inpaint_mask
+                control = torch.where(drop, null, control)
 
             conditioning[cond_id] = [control]
 
@@ -475,12 +533,14 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
 
             # Create a mask of random length for a random slice of the input
             inpaint_masked_input, inpaint_mask, tf_inpaint_mask = random_inpaint_mask(diffusion_input, padding_masks=augmented_padding_mask, mask_padding=self.mask_padding_attention, **self.inpaint_mask_kwargs)
+            # Context CFG dropout (values only, mask kept), independent of the control dropout below.
+            inpaint_masked_input, inpaint_mask = apply_inpaint_dropout(inpaint_masked_input, inpaint_mask, self.inpaint_dropout_prob)
 
             conditioning['inpaint_mask'] = [inpaint_mask]
             conditioning['inpaint_masked_input'] = [inpaint_masked_input]
             conditioning['tf_inpaint_mask'] = [tf_inpaint_mask]
 
-            self._add_streamgen_conditioning(conditioning, metadata, tf_inpaint_mask)
+            self._add_streamgen_conditioning(conditioning, metadata, tf_inpaint_mask, dropout_prob=self.control_dropout_prob)
 
             # Only compute loss on inpainted region (where model is generating)
             loss_mask = loss_mask & ~inpaint_mask.squeeze(1).to(torch.bool)

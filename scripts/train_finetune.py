@@ -273,6 +273,18 @@ def train(args):
     )
     print(f"Inpainting config: {inpainting_config}")
 
+    # CFG dropout, also from the model config's training section. cfg_dropout_prob is the
+    # DiT's own dropout of the cross-attention / prepend conds (the prompt); control_dropout_prob
+    # is the training wrapper's dropout of the sidecar controls (null token under the tf mask,
+    # DiffusionCondTrainingWrapper._add_streamgen_conditioning); inpaint_dropout_prob drops the
+    # inpainting context's values (inpaint_masked_input to zero, mask kept, apply_inpaint_dropout). Each is drawn
+    # independently per item; 0 = never dropped.
+    training_cfg = model_config.get("training", {})
+    cfg_dropout_prob = training_cfg.get("cfg_dropout_prob", 0.1)
+    control_dropout_prob = training_cfg.get("control_dropout_prob", 0.0)
+    inpaint_dropout_prob = training_cfg.get("inpaint_dropout_prob", 0.0)
+    print(f"CFG dropout: prompt {cfg_dropout_prob}, control {control_dropout_prob}, inpaint context {inpaint_dropout_prob}")
+
     training_wrapper = DiffusionCondTrainingWrapper(
         model,
         mask_loss_weight=1.0,
@@ -280,6 +292,9 @@ def train(args):
         silence_extension_scale_seconds=4.0,
         pre_encoded=True,
         use_ema=args.use_ema,
+        cfg_dropout_prob=cfg_dropout_prob,
+        control_dropout_prob=control_dropout_prob,
+        inpaint_dropout_prob=inpaint_dropout_prob,
         log_loss_info=False,
         optimizer_configs=optimizer_config,
         timestep_sampler="trunc_logit_normal",

@@ -281,3 +281,57 @@ Stems already counted in 3.2. Latents: 256 ch × 10.77 Hz × fp16 ≈ 5.5 kB/s �
   Slakh encodes in experiment 01 have the same property. Whether to disable the flipper for
   pre-encoding is an open call — it is a legitimate augmentation, but frozen at one roll per
   item it is just noise in the data rather than an augmentation.
+
+## Control CFG dropout (2026-10-03)
+
+Listening to the four arms side by side (`scripts/wjd/listen_wjd_arms.py`, pages under
+`/data/scratch-fast/snnithya/sao-3/listening/`) raised the question of what the CFG scale acts
+on. In this repo the DiT's `cfg_dropout_prob` (0.1) nulls only the cross-attention and prepend
+conds, i.e. the prompt; the inpaint conds, `tf_inpaint_mask` and the control (`streamgen_latent`,
+`drums_rms`, `drums_tria_*`) were present on every training step. So inference CFG could only
+contrast prompt vs no prompt, and "zero the control" was an input the model had never seen.
+sat-zenon (`stable_audio_tools/models/dit.py`, Nithya's fork) was different: it dropped each
+`input_add` group independently with p = 0.4 in `base-fused-inp-add.json`, which is what made
+its two-axis inpaint x streamgen multi-CFG demo work.
+
+Added `control_dropout_prob` (training section of the model config, read by
+`scripts/train_finetune.py`, applied in `DiffusionCondTrainingWrapper._add_streamgen_conditioning`):
+per item, with that probability, every sidecar control's values are replaced by an
+**unconditional token** while `tf_inpaint_mask` is left untouched (Nithya's call, over a first
+version that zeroed control and mask together). The token sits on the frames the mask marks
+visible; hidden frames stay 0. That keeps three states apart: *unconditional* (token under a
+visible mask), *hidden* (0 under a zero mask) and *silent drums* (0 under a visible mask, since
+RMS and TRIA map silence to 0 and the latent's zero is a -30 dBFS hiss, not silence). The token
+is a constant just above the control's permissible range, `null_value` in the control's
+`modular_local_cond_configs` entry so inference can build the same null: 1 + 1/32 = 1.03125 for
+`drums_rms` / `drums_tria_*` (one TRIA level above the top of [0, 1]; also the default
+`CONTROL_NULL_VALUE_DEFAULT`), and **0 for `streamgen_latent`**, as sat-zenon did (Nithya,
+2026-10-03). The latent has no "just above the range": its softnorm values are roughly unit-variance
+with |z| up to ~4 on the validation sidecars, so a first draft used a constant 5.0. Zero was chosen
+instead to match sat-zenon's null for the same control. The three-state separation still holds
+for the latent because its zero is not silence (the autoencoder's silence latent is a different
+vector), so 0 under a visible tf mask is already a value no real drum frame produces. The draw is independent of the prompt dropout. Set to 0.1 in the four
+controlled arm configs; the baseline has no control and no key. The runs started 2026-10-03
+before this change (jobs 2535271/2535278/2535273/2535276 and their requeues) do not have it; a
+`FRESH=1` resubmit of each arm picks it up. `train_finetune.py` now also passes the config's
+`cfg_dropout_prob` instead of relying on the wrapper default. `mask_loss_weight` in the configs is still
+not read (train_finetune.py hardcodes 1.0 for the context-reconstruction term); noted in the config comments.
+
+Also added `inpaint_dropout_prob` (same place in the config and in `train_finetune.py`; applied by
+`apply_inpaint_dropout` in the training step): per item, with that probability, the inpainting
+context's **values** are nulled, `inpaint_masked_input` to the zero latent, while `inpaint_mask`
+is kept (Nithya: "keep the mask, don't null the mask", same shape as the control dropout). The
+zero latent is the null here as for `streamgen_latent` and in sat-zenon; it is a value no real
+frame produces (the silence latent is not the zero vector), so "context nulled" (0 under a
+visible mask) stays distinct from FULL_MASK's "no context" (0 under a zero mask). Because the
+mask is unchanged, the loss mask is unchanged: a dropped item is still scored only on the region it
+was asked to generate. The tf mask and the control stay, so a dropped item is "continue a stem you
+cannot hear, drums still given". The draw is independent of the control dropout and of the prompt
+dropout. 0.4 in the four controlled arms (Nithya); `small_music_baseline.json` has 0.1 for prompt and
+context, so it is not a matched recipe at the moment. This is the second axis of
+a sat-zenon-style multi-CFG (context x control) once the inference side exists.
+
+Not done yet: the inference side. `sample_diffusion` / the DiT's `cfg_scale` still only form the
+prompt null; a control-CFG (`v = v(no ctrl) + s * (v(ctrl) - v(no ctrl))`, with the control set to
+its `null_value` under the same tf mask in the null branch) needs its own scale and a third forward, as sat-zenon's
+`make_multicfg_denoiser` does. Tests: `tests/test_control_conditioning.py` (dropout section).

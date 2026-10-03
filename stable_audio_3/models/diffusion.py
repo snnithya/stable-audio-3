@@ -47,6 +47,7 @@ class ConditionedDiffusionModelWrapper(nn.Module):
             input_concat_ids: tp.List[str] = [],
             local_add_cond_ids: tp.List[str] = [],
             modular_local_cond_ids: tp.List[str] = [],
+            modular_local_cond_null_values: tp.Optional[tp.Dict[str, float]] = None,
             prepend_cond_ids: tp.List[str] = [],
             ):
         super().__init__()
@@ -62,6 +63,7 @@ class ConditionedDiffusionModelWrapper(nn.Module):
         self.input_concat_ids = input_concat_ids
         self.local_add_cond_ids = local_add_cond_ids
         self.modular_local_cond_ids = modular_local_cond_ids
+        self.modular_local_cond_null_values = dict(modular_local_cond_null_values or {})
         self.prepend_cond_ids = prepend_cond_ids
         self.min_input_length = min_input_length
         self.mask_padding_attention = mask_padding_attention
