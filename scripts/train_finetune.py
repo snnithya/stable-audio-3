@@ -71,6 +71,48 @@ from stable_audio_3.data.utils import (
 )
 
 
+def build_lr_scheduler_config(args):
+    """The 'scheduler' entry of the optimizer config from the --lr_schedule flags, or None.
+
+    Every schedule is stepped per optimizer step (DiffusionCondTrainingWrapper returns it
+    with interval "step"), so the numbers below are in optimizer steps, i.e. the same unit
+    as --steps and the x-axis in wandb.
+
+      none        constant lr (the default; what every run before 2026-10-03 used)
+      inverse     stable-audio-tools' InverseLR: lr * (1 + t/inv_gamma)^-power with an
+                  exponential warmup factor 1 - lr_warmup_decay^(t+1). sat-zenon's streamgen
+                  finetunes used inv_gamma 1e6, power 0.5, warmup 0.995, which is in effect
+                  a ~1k-step warmup and then constant (x0.95 at 100k steps).
+      cosine      linear warmup over --lr_warmup_steps, then cosine from lr down to
+                  lr * --lr_final_frac at --steps.
+      exponential lr * gamma^t with gamma = --lr_gamma (sat-zenon also used 0.999996).
+    """
+    if args.lr_schedule == "none":
+        return None
+    if args.lr_schedule == "inverse":
+        return {
+            "type": "InverseLR",
+            "config": {
+                "inv_gamma": args.lr_inv_gamma,
+                "power": args.lr_power,
+                "warmup": args.lr_warmup_decay,
+                "final_lr": 0.0,
+            },
+        }
+    if args.lr_schedule == "cosine":
+        return {
+            "type": "WarmupCosineLR",
+            "config": {
+                "total_steps": args.steps,
+                "warmup_steps": args.lr_warmup_steps,
+                "final_frac": args.lr_final_frac,
+            },
+        }
+    if args.lr_schedule == "exponential":
+        return {"type": "ExponentialLR", "config": {"gamma": args.lr_gamma}}
+    raise ValueError(f"unknown --lr_schedule {args.lr_schedule!r}")
+
+
 def load_model(model_name: str, device: torch.device, model_config_path: str = None):
     """Build the model from `model_name`'s pretrained weights.
 
@@ -185,6 +227,10 @@ def train(args):
             }
         }
     }
+    scheduler_config = build_lr_scheduler_config(args)
+    if scheduler_config is not None:
+        optimizer_config["diffusion"]["scheduler"] = scheduler_config
+    print(f"LR schedule: {scheduler_config or 'constant'}")
 
     # Optionally freeze sub-components before handing to the training wrapper
     if args.freeze_pretransform and model.pretransform is not None:
@@ -308,6 +354,19 @@ def train(args):
 
     callbacks = [ckpt_callback, exc_callback, demo_callback]
 
+    # Preemption / requeue: a last.ckpt refreshed every --resume_every steps, independent of
+    # the kept checkpoints above (save_top_k=0 keeps nothing but still writes last.ckpt).
+    # The sbatch body passes it back as --resume_ckpt when the job is requeued.
+    if args.resume_every and args.resume_every > 0 and checkpoint_dir is not None:
+        callbacks.append(
+            pl.callbacks.ModelCheckpoint(
+                every_n_train_steps=args.resume_every,
+                dirpath=checkpoint_dir,
+                save_top_k=0,
+                save_last=True,
+            )
+        )
+
     if args.export_safetensors:
         export_dir = os.path.join(args.save_dir, "safetensors_exports")
         callbacks.append(SafetensorsExportCallback(export_dir))
@@ -397,6 +456,24 @@ def main():
         "--weight_decay", type=float, default=0.01, help="AdamW weight decay"
     )
     p.add_argument("--steps", type=int, default=10_000, help="Total training steps")
+    p.add_argument(
+        "--lr_schedule",
+        choices=["none", "inverse", "cosine", "exponential"],
+        default="none",
+        help="Learning-rate schedule, stepped per optimizer step; see build_lr_scheduler_config",
+    )
+    p.add_argument("--lr_inv_gamma", type=float, default=1_000_000, help="inverse: steps to decay to 2^-power")
+    p.add_argument("--lr_power", type=float, default=0.5, help="inverse: decay exponent")
+    p.add_argument(
+        "--lr_warmup_decay", type=float, default=0.995,
+        help="inverse: exponential warmup factor (0 disables); 0.995 reaches 99%% of lr after ~900 steps",
+    )
+    p.add_argument("--lr_warmup_steps", type=int, default=1000, help="cosine: linear warmup length in steps")
+    p.add_argument(
+        "--lr_final_frac", type=float, default=0.1,
+        help="cosine: lr at --steps as a fraction of --lr",
+    )
+    p.add_argument("--lr_gamma", type=float, default=0.999996, help="exponential: per-step multiplier")
     p.add_argument("--batch_size", type=int, default=1)
     p.add_argument("--accum_batches", type=int, default=1, help="Gradient accumulation steps")
     p.add_argument(
@@ -446,7 +523,14 @@ def main():
     p.add_argument("--name", type=str, default="test")
     p.add_argument("--group", type=str, default="debug")
     p.add_argument("--save_dir", type=str, default="/data/scratch-fast/snnithya/sao-3/ft_checkpoints/debug")
-    p.add_argument("--checkpoint_every", type=int, default=500)
+    p.add_argument("--checkpoint_every", type=int, default=500, help="Keep a checkpoint every N steps")
+    p.add_argument(
+        "--resume_every",
+        type=int,
+        default=1000,
+        help="Refresh last.ckpt every N steps as the resume point after preemption (0 disables); "
+        "kept checkpoints still follow --checkpoint_every",
+    )
     p.add_argument("--log_every", type=int, default=100)
     p.add_argument(
         "--demo_every",

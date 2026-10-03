@@ -3,10 +3,12 @@
 #SBATCH --partition=csail-shared-h200
 #SBATCH --qos=shared-if-available
 #SBATCH --account=hai-res
-#SBATCH --gres=gpu:2
+#SBATCH --gres=gpu:l40s:2
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=128G
 #SBATCH --time=24:00:00
+#SBATCH --requeue
+#SBATCH --open-mode=append
 #SBATCH --output=/data/scratch-fast/snnithya/sao-3/logs/03_3_finetune_wjd_audio_%j.out
 #SBATCH --error=/data/scratch-fast/snnithya/sao-3/logs/03_3_finetune_wjd_audio_%j.out
 #

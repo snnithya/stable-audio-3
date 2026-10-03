@@ -24,6 +24,9 @@
 
 set -euo pipefail
 
+# Fail before cloning anything if a per-arm script forgot to set these.
+: "${ARM:?set by the per-arm sbatch script}" "${MODEL_CONFIG:?}" "${GROUP:?}"
+
 # This experiment lives on tap-dance-expt in the sa3-tap checkout, not on v/r.
 REPO=/data/hai-res/snnithya/sa3-tap/stable-audio-3
 branch=tap-dance-expt
@@ -40,7 +43,36 @@ export HF_HOME=/data/hai-res/snnithya/.cache/huggingface
 SAVE_BASE=/data/scratch-fast/snnithya/sao-3/ft_checkpoints
 mkdir -p /data/scratch-fast/snnithya/sao-3/logs
 
-SAO_REF=${SAO_REF:-$(git -C "$REPO" rev-parse HEAD)}
+# Restart on preemption. The partition preempts by QoS with PreemptMode=REQUEUE and
+# GraceTime=0: a preempted job gets SIGTERM, SIGKILL 10 s later, and Slurm requeues it
+# under the SAME job id (the arm headers set --requeue and --open-mode=append). Nothing can
+# be checkpointed in those 10 s, so the restart resumes from the last.ckpt that
+# train_finetune.py refreshes every --resume_every steps. Three things make that work:
+#  * the wandb run id is derived from the job id, so the requeued job resumes the same
+#    wandb run and lands in the same checkpoint dir (<save_dir>/<project>/<run id>/checkpoints);
+#  * the git ref is recorded next to the run on first start and reused, so a requeue does
+#    not pick up commits made in the meantime;
+#  * --resume_ckpt is passed whenever that dir already holds a last.ckpt.
+# To continue a run by hand (e.g. after the 24 h MaxWall of hai-res-main), resubmit with its
+# id:  WANDB_RUN_ID=wjd-rms-2534900 sbatch sbatch/03_3_finetune_wjd_rms.sbatch
+export WANDB_RUN_ID=${WANDB_RUN_ID:-wjd-${ARM}-${SLURM_JOB_ID:-local}}
+export WANDB_RESUME=allow
+WANDB_PROJECT_NAME=sao-3
+RUN_DIR=${SAVE_BASE}/${GROUP}/${ARM}/${WANDB_PROJECT_NAME}/${WANDB_RUN_ID}
+mkdir -p "$RUN_DIR"
+REF_FILE=$RUN_DIR/sao_ref
+if [ -f "$REF_FILE" ]; then
+    SAO_REF=$(cat "$REF_FILE")
+    echo "requeue/continuation of ${WANDB_RUN_ID}: pinned to ${SAO_REF} from ${REF_FILE}"
+else
+    SAO_REF=${SAO_REF:-$(git -C "$REPO" rev-parse HEAD)}
+    echo "$SAO_REF" > "$REF_FILE"
+fi
+RESUME=()
+if [ -f "$RUN_DIR/checkpoints/last.ckpt" ]; then
+    RESUME=(--resume_ckpt "$RUN_DIR/checkpoints/last.ckpt")
+    echo "resuming from $RUN_DIR/checkpoints/last.ckpt ($(date -r "$RUN_DIR/checkpoints/last.ckpt" -Is))"
+fi
 if ! git -C "$REPO" diff-index --quiet HEAD --; then
     echo "WARNING: ${REPO} has uncommitted changes; this job runs ${SAO_REF} without them."
 fi
@@ -60,29 +92,52 @@ export PYTHONPATH="$PWD"
 # selects the earlier whole-track one.
 DATASET_CONFIG=${DATASET_CONFIG:-stable_audio_3/configs/dataset_configs/preencoded/wjd_stems_train_chunked_preencoded.json}
 
-: "${ARM:?set by the per-arm sbatch script}" "${MODEL_CONFIG:?}" "${GROUP:?}"
 SAVE_ROOT=${SAVE_BASE}/${GROUP}
 
+# Effective batch (samples per optimizer step) is fixed at EFFECTIVE_BATCH; the per-GPU
+# batch defaults to EFFECTIVE_BATCH / NGPU with no gradient accumulation, i.e. the whole
+# step is one forward/backward spread over the GPUs the arm's header requested (items are
+# 130 latent frames, so a large per-GPU batch fits). --batch_size is PER GPU under Lightning
+# DDP, which is why it is derived here rather than written once for every GPU count.
+# If a per-GPU batch of EFFECTIVE_BATCH / NGPU runs out of memory, force a smaller one and
+# the difference is made up by accumulation:  MICRO_BATCH=32 sbatch sbatch/03_3_finetune_wjd_rms.sbatch
+EFFECTIVE_BATCH=${EFFECTIVE_BATCH:-512}
+NGPU=${SLURM_GPUS_ON_NODE:-$(nvidia-smi -L | wc -l)}
+if (( EFFECTIVE_BATCH % NGPU != 0 )); then
+    echo "EFFECTIVE_BATCH=${EFFECTIVE_BATCH} is not a multiple of NGPU=${NGPU}" >&2
+    exit 2
+fi
+MICRO_BATCH=${MICRO_BATCH:-$(( EFFECTIVE_BATCH / NGPU ))}
+if (( EFFECTIVE_BATCH % (MICRO_BATCH * NGPU) != 0 )); then
+    echo "EFFECTIVE_BATCH=${EFFECTIVE_BATCH} is not a multiple of MICRO_BATCH x NGPU = ${MICRO_BATCH} x ${NGPU}" >&2
+    exit 2
+fi
+ACCUM=$(( EFFECTIVE_BATCH / (MICRO_BATCH * NGPU) ))
+
 echo "host=$(hostname) arm=${ARM} config=${MODEL_CONFIG} ref=${SAO_REF} started=$(date -Is)"
+echo "gpus=${NGPU} micro_batch=${MICRO_BATCH} accum=${ACCUM} -> effective batch $(( MICRO_BATCH * NGPU * ACCUM )) per optimizer step"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 
 "$PYTHON" scripts/train_finetune.py \
     --model small-music \
     --model_config "${MODEL_CONFIG}" \
     --dataset_config "${DATASET_CONFIG}" \
-    --steps 20000 \
-    --batch_size 8 \
-    --accum_batches 2 \
+    --steps 100000 \
+    --batch_size "${MICRO_BATCH}" \
+    --accum_batches "${ACCUM}" \
     --lr 1e-5 \
+    --lr_schedule inverse --lr_inv_gamma 1000000 --lr_power 0.5 --lr_warmup_decay 0.995 \
     --seed 42 \
     --freeze_conditioner \
     --num_workers 12 \
     --checkpoint_every 5000 \
-    --demo_every 2000 \
+    --demo_every 1000 \
     --log_every 50 \
     --export_safetensors \
     --logger wandb \
-    --project sao-3 \
+    --project "${WANDB_PROJECT_NAME}" \
+    --resume_every 1000 \
+    "${RESUME[@]}" \
     --group "${GROUP}" \
     --name "wjd-${ARM}" \
     --save_dir "${SAVE_ROOT}/${ARM}"

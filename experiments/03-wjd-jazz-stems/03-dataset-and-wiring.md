@@ -93,6 +93,24 @@ feature-only sidecar and do not fit the new configs. Known cosmetic issue: the r
 scan also picks up `_sanity_check/*_feature_*.npy` (6 per stem dir); the loader catches the
 missing JSON and resamples, so training is unaffected, but `Found N files` is 24 too high.
 
+**Training-job plumbing (2026-10-03):** one sbatch per arm (`sbatch/03_3_finetune_wjd_<arm>.sbatch`,
+shared body `03_3_finetune_wjd_common.sh`) so each arm can run under its own QoS. The body
+fixes the **effective batch at 128 samples per optimizer step** and derives `--batch_size`
+(per GPU under DDP) as 128 / GPUs with no accumulation (`MICRO_BATCH` forces a smaller
+per-GPU batch and the rest becomes accumulation). **Preemption:** the partition preempts by
+QoS with REQUEUE and GraceTime 0, so the headers set `--requeue --open-mode=append`, the body
+derives the wandb run id from the Slurm job id (`wjd-<arm>-<jobid>`, `WANDB_RESUME=allow`),
+pins the git ref in `<run dir>/sao_ref` on first start, and passes `--resume_ckpt
+<run dir>/checkpoints/last.ckpt` whenever it exists; `train_finetune.py --resume_every 1000`
+refreshes that `last.ckpt` independently of the kept 5000-step checkpoints. A requeued job
+therefore loses at most 1000 steps and continues the same wandb run. Manual continuation:
+`WANDB_RUN_ID=wjd-rms-<jobid> sbatch sbatch/03_3_finetune_wjd_rms.sbatch`. `--lr_schedule
+{none,inverse,cosine,exponential}` was added to `train_finetune.py` (default `none`, i.e.
+unchanged); the WJD arms use **sat-zenon's schedule** (`saos_streamgen_latent.json`): `InverseLR`, `inv_gamma 1e6`,
+`power 0.5`, `warmup 0.995`, i.e. an exponential warmup reaching 50 % of the lr at step 138
+and 99 % at step 918, then lr × (1 + t/1e6)^-0.5, which is ×0.95 at 100k steps. Base lr stays
+1e-5 (sat-zenon's finetune used 1e-4 with weight decay 1e-3).
+
 **Run log**
 
 | Date | What | Job | Notes |
@@ -103,6 +121,8 @@ missing JSON and resamples, so training is unaffected, but `Found N files` is 24
 | | chunked pre-encode, validation | — | `SPLIT=validation sbatch sbatch/03_3_preencode_wjd.sbatch`, not yet run |
 | 2026-10-02/03 | chunked pre-encode, train + validation, feature-only | 2534339 / 2534336 | re-runs after the output dir was removed; 5-ch sidecar, superseded by the all-four-controls default below |
 | | chunked pre-encode, train + validation, all four controls | — | `sbatch sbatch/03_3_preencode_wjd.sbatch` and `SPLIT=validation sbatch ...` with the new default; same output dirs, so cancel any feature-only run first |
+| 2026-10-03 | finetunes rms / tria_ema / tria_fixed, first attempt | 2534778-80 | failed at wandb.init, "No API key configured": the job had no credentials (~/.netrc is on AFS, .env was not sourced). Fixed: `03_3_finetune_wjd_common.sh` sources `$REPO/.env` with `set -a`. |
+| 2026-10-03 | tria_fixed on 4 GPUs | 2534818 | hung after ranks 1 and 3 crashed at the first demo: `get_rank()` read `SLURM_PROCID` (0 in every DDP subprocess of a single-task sbatch) ahead of the process group, so all four ranks wrote and deleted the same `demo_cfg_4_*.wav`. Fixed in `training/utils.py` (`tests/test_training_utils_rank.py`). Note: batch_size is per GPU, so N GPUs multiply the effective batch (8 × N × accum 2); keep `batch × gpus × accum` constant across arms for comparability. |
 | | finetunes (rms / tria_fixed / tria_ema / audio) | — | `sbatch sbatch/03_3_finetune_wjd_<arm>.sbatch`, one per arm (own `--qos` each), once the all-controls encode is done |
 
 **Still to do:** the wiring table below on the real latents (step-0 no-op, gradient reaches the control, alignment by listening), then the finetune and its evaluation. Open knobs: conditioner frozen vs trainable (prompts vary here, unlike Slakh); demos cannot yet play the conditioning drums, since the RMS control is not decodable — a demo-side lookup of `tracks/drums/<track>/drums.flac` at `latent_crop_start` would fix that.

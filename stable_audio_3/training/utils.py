@@ -9,15 +9,23 @@ import os
 import typing as tp
 
 def get_rank():
-    """Get rank of current process."""
+    """Global rank of the current process.
 
-    if "SLURM_PROCID" in os.environ:
-        return int(os.environ["SLURM_PROCID"])
+    The process group is authoritative once it exists. Before that, fall back to the
+    launcher's environment: ``RANK`` (torchrun), ``LOCAL_RANK`` (Lightning's DDP launcher,
+    single node), then ``SLURM_PROCID`` (one process per srun task). SLURM_PROCID must come
+    last: a single-task sbatch whose Trainer spawns N DDP subprocesses hands every one of
+    them SLURM_PROCID=0, so checking it first made all ranks believe they were rank zero and
+    race on the same demo files (job 2534818, 2026-10-03).
+    """
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank()
 
-    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
-        return 0
+    for key in ("RANK", "LOCAL_RANK", "SLURM_PROCID"):
+        if key in os.environ:
+            return int(os.environ[key])
 
-    return torch.distributed.get_rank()
+    return 0
 
 class InverseLR(torch.optim.lr_scheduler._LRScheduler):
     """Implements an inverse decay learning rate schedule with an optional exponential
@@ -57,6 +65,36 @@ class InverseLR(torch.optim.lr_scheduler._LRScheduler):
         lr_mult = (1 + self.last_epoch / self.inv_gamma) ** -self.power
         return [warmup * max(self.final_lr, base_lr * lr_mult)
                 for base_lr in self.base_lrs]
+
+class WarmupCosineLR(torch.optim.lr_scheduler.LRScheduler):
+    """Linear warmup over ``warmup_steps`` optimizer steps, then cosine decay from the base lr
+    to ``final_frac * base_lr`` at ``total_steps``, constant afterwards. Stepped per
+    optimizer step (the wrapper returns schedulers with interval "step").
+    """
+
+    def __init__(self, optimizer, total_steps, warmup_steps=0, final_frac=0.1, last_epoch=-1):
+        if total_steps <= 0:
+            raise ValueError("total_steps must be positive")
+        if not 0.0 <= final_frac <= 1.0:
+            raise ValueError("final_frac must be in [0, 1]")
+        self.total_steps = int(total_steps)
+        self.warmup_steps = int(warmup_steps)
+        self.final_frac = float(final_frac)
+        super().__init__(optimizer, last_epoch)
+
+    def get_lr(self):
+        return self._get_closed_form_lr()
+
+    def _get_closed_form_lr(self):
+        t = self.last_epoch
+        if self.warmup_steps > 0 and t < self.warmup_steps:
+            mult = (t + 1) / self.warmup_steps
+        else:
+            span = max(1, self.total_steps - self.warmup_steps)
+            progress = min(1.0, max(0.0, (t - self.warmup_steps) / span))
+            mult = self.final_frac + (1.0 - self.final_frac) * 0.5 * (1.0 + math.cos(math.pi * progress))
+        return [base_lr * mult for base_lr in self.base_lrs]
+
 
 def create_optimizer_from_config(optimizer_config, parameters):
     """Create optimizer from config.
@@ -103,6 +141,8 @@ def create_scheduler_from_config(scheduler_config, optimizer):
     """
     if scheduler_config["type"] == "InverseLR":
         scheduler_fn = InverseLR
+    elif scheduler_config["type"] == "WarmupCosineLR":
+        scheduler_fn = WarmupCosineLR
     else:
         scheduler_fn = getattr(torch.optim.lr_scheduler, scheduler_config["type"])
     scheduler = scheduler_fn(optimizer, **scheduler_config["config"])

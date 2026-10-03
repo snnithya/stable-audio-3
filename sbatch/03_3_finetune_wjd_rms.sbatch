@@ -7,6 +7,8 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=128G
 #SBATCH --time=24:00:00
+#SBATCH --requeue
+#SBATCH --open-mode=append
 #SBATCH --output=/data/scratch-fast/snnithya/sao-3/logs/03_3_finetune_wjd_rms_%j.out
 #SBATCH --error=/data/scratch-fast/snnithya/sao-3/logs/03_3_finetune_wjd_rms_%j.out
 #
