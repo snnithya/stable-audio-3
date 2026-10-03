@@ -113,6 +113,31 @@ def build_lr_scheduler_config(args):
     raise ValueError(f"unknown --lr_schedule {args.lr_schedule!r}")
 
 
+def build_resume_checkpoint_callback(resume_every, checkpoint_dir):
+    """A ModelCheckpoint that only refreshes last.ckpt every ``resume_every`` steps, or None.
+
+    This is the resume point after a Slurm preemption (the sbatch body passes it back as
+    --resume_ckpt); the kept checkpoints follow --checkpoint_every separately. save_top_k=0
+    keeps nothing but still writes last.ckpt.
+
+    The decision to add it must NOT depend on ``checkpoint_dir``: under DDP only rank 0 knows
+    the wandb run id that ``checkpoint_dir`` is built from, so the other ranks see None. Every
+    ModelCheckpoint broadcasts its resolved dirpath in ``setup`` (a collective), so a callback
+    that exists on rank 0 only leaves the ranks with different collective sequences and the
+    job deadlocks in setup before the first step (jobs 2535097-99, 2026-10-03). With
+    ``dirpath=None`` Lightning resolves the dir on rank 0 and broadcasts it, which is exactly
+    how the main checkpoint callback already behaves on the non-zero ranks.
+    """
+    if not resume_every or resume_every <= 0:
+        return None
+    return pl.callbacks.ModelCheckpoint(
+        every_n_train_steps=resume_every,
+        dirpath=checkpoint_dir,
+        save_top_k=0,
+        save_last=True,
+    )
+
+
 def load_model(model_name: str, device: torch.device, model_config_path: str = None):
     """Build the model from `model_name`'s pretrained weights.
 
@@ -354,18 +379,9 @@ def train(args):
 
     callbacks = [ckpt_callback, exc_callback, demo_callback]
 
-    # Preemption / requeue: a last.ckpt refreshed every --resume_every steps, independent of
-    # the kept checkpoints above (save_top_k=0 keeps nothing but still writes last.ckpt).
-    # The sbatch body passes it back as --resume_ckpt when the job is requeued.
-    if args.resume_every and args.resume_every > 0 and checkpoint_dir is not None:
-        callbacks.append(
-            pl.callbacks.ModelCheckpoint(
-                every_n_train_steps=args.resume_every,
-                dirpath=checkpoint_dir,
-                save_top_k=0,
-                save_last=True,
-            )
-        )
+    resume_callback = build_resume_checkpoint_callback(args.resume_every, checkpoint_dir)
+    if resume_callback is not None:
+        callbacks.append(resume_callback)
 
     if args.export_safetensors:
         export_dir = os.path.join(args.save_dir, "safetensors_exports")
