@@ -24,11 +24,19 @@
 
 set -euo pipefail
 
-export HF_HOME=/data/hai-res/snnithya/.cache/huggingface
-
 # This experiment lives on tap-dance-expt in the sa3-tap checkout, not on v/r.
 REPO=/data/hai-res/snnithya/sa3-tap/stable-audio-3
 branch=tap-dance-expt
+
+# Secrets and wandb dirs (WANDB_API_KEY, WANDB_DIR, ...) live in the checkout's gitignored
+# .env, as 03_1_fetch_wjd_youtube.sbatch does. A batch job has no interactive login and
+# ~/.netrc sits on AFS, which the compute nodes do not read, so without this wandb.init
+# dies with "No API key configured" (jobs 2534778-80, 2026-10-03). set -a exports every
+# assignment so the Python process inherits them.
+set -a
+source "$REPO/.env"
+set +a
+export HF_HOME=/data/hai-res/snnithya/.cache/huggingface
 SAVE_BASE=/data/scratch-fast/snnithya/sao-3/ft_checkpoints
 mkdir -p /data/scratch-fast/snnithya/sao-3/logs
 
