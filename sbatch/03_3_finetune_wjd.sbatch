@@ -21,13 +21,18 @@
 #                          dataset-statistics normalisation (3.4, T1-fixed)
 #   task 3  tria_ema    -- small_music_wjd_drums_tria_ema.json: same bands, running (EMA)
 #                          normalisation (3.4, T1-ema)
+#   task 4  audio       -- small_music_streamgen.json: the drum stem's 256-ch VAE latent as
+#                          'streamgen_latent', the Slakh-style condition (3.3's original plan)
 #
 #   sbatch sbatch/03_3_finetune_wjd.sbatch                # the rms run
 #   sbatch --array=0-1 sbatch/03_3_finetune_wjd.sbatch    # rms + baseline pair
 #   sbatch --array=2-3 sbatch/03_3_finetune_wjd.sbatch    # the two TRIA arms
+#   sbatch --array=0,2-4 sbatch/03_3_finetune_wjd.sbatch  # the four control arms
 #
-# All arms read the same pre-encoded items; the sidecar carries every control and the
-# model config names the one its arm uses.
+# All arms read the same pre-encoded items; the sidecar carries every control (encode with
+# the sbatch default WJD_CONTROL_MODE=audio,rms,tria_fixed,tria_ema) and the model config
+# names the one its arm uses. The audio arm needs the 256-ch block in the sidecar: an
+# encode made without 'audio' fails it at the first batch (missing streamgen_latent).
 #
 # Mirrors 01_2_finetune.sbatch: same pretrained small-music, same causal inpainting task,
 # same optimizer, same seed. Items are 12 s chunks (130 frames; whole-track latents cropped to 144 frames (13.3 s) with the old config)
@@ -70,14 +75,15 @@ export PYTHONPATH="$PWD"
 # selects the earlier whole-track one.
 DATASET_CONFIG=${DATASET_CONFIG:-stable_audio_3/configs/dataset_configs/preencoded/wjd_stems_train_chunked_preencoded.json}
 
-ARMS=(rms base tria_fixed tria_ema)
+ARMS=(rms base tria_fixed tria_ema audio)
 CONFIGS=(
     stable_audio_3/configs/model_configs/small_music_wjd_drums_rms.json
     stable_audio_3/configs/model_configs/small_music_baseline.json
     stable_audio_3/configs/model_configs/small_music_wjd_drums_tria_fixed.json
     stable_audio_3/configs/model_configs/small_music_wjd_drums_tria_ema.json
+    stable_audio_3/configs/model_configs/small_music_streamgen.json
 )
-GROUPS_=(03-3-wjd-drums-rms 03-3-wjd-drums-rms 03-4-wjd-tria 03-4-wjd-tria)
+GROUPS_=(03-3-wjd-drums-rms 03-3-wjd-drums-rms 03-4-wjd-tria 03-4-wjd-tria 03-3-wjd-drums-audio)
 ARM=${ARMS[$SLURM_ARRAY_TASK_ID]}
 MODEL_CONFIG=${CONFIGS[$SLURM_ARRAY_TASK_ID]}
 GROUP=${GROUPS_[$SLURM_ARRAY_TASK_ID]}

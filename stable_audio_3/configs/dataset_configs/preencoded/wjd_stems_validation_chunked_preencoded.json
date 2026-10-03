@@ -14,14 +14,16 @@
     "latent_crop_length": 130,
     "random_crop": false,
     "controls": [
+        "streamgen_latent",
         "drums_rms",
         "drums_tria_fixed",
         "drums_tria_ema"
     ],
     "controls_dim": [
+        256,
         1,
         2,
         2
     ],
-    "_comment": "WJD stem mirror, validation split, pre-encoded as CHUNKS by sbatch/03_3_preencode_wjd.sbatch (pre_encode_dataset.py --chunk_seconds 12 --chunk_hop_ratio 0.5 --pad, i.e. 130-frame / 12.07 s windows every 65 frames, 50 % overlap; decided 2026-10-02 over the earlier whole-track-capped-at-380-s encode in preencoded/). One item per window, every window of every track, silence-gated per window; 'latent_crop_length' 130 equals the window so nothing is cropped and 'random_crop' is moot; it MUST equal the window in frames (ceil(CHUNK_SECONDS*44100/4096)), so change it together with CHUNK_SECONDS in the sbatch. The prompt is in each sidecar JSON (custom_md_wjd.py at pre-encode time) and PreEncodedDataset passes it through. 'controls'/'controls_dim' must list EVERY key in the sidecar in its order (control_keys/controls_dim in the sidecar JSONs): PreEncodedDataset splits the fused array by position. The model config names the one(s) it uses (drums_rms for 3.3, drums_tria_fixed / drums_tria_ema for 3.4); the training wrapper attaches those and ignores the rest. Each sidecar also records chunk_index, n_chunks, chunk_offset (samples), chunk_offset_seconds and chunk_samples."
+    "_comment": "WJD stem mirror, validation split, pre-encoded as CHUNKS by sbatch/03_3_preencode_wjd.sbatch (pre_encode_dataset.py --chunk_seconds 12 --chunk_hop_ratio 0.5 --pad, i.e. 130-frame / 12.07 s windows every 65 frames, 50 % overlap; decided 2026-10-02 over the earlier whole-track-capped-at-380-s encode in preencoded/). One item per window, every window of every track, silence-gated per window; 'latent_crop_length' 130 equals the window so nothing is cropped and 'random_crop' is moot; it MUST equal the window in frames (ceil(CHUNK_SECONDS*44100/4096)), so change it together with CHUNK_SECONDS in the sbatch. The prompt is in each sidecar JSON (custom_md_wjd.py at pre-encode time) and PreEncodedDataset passes it through. 'controls'/'controls_dim' must list EVERY key in the sidecar in its order (control_keys/controls_dim in the sidecar JSONs): PreEncodedDataset splits the fused array by position, and the NAMES here are what training sees (the sidecar's own key names are not used). Since 2026-10-03 the sbatch default WJD_CONTROL_MODE=audio,rms,tria_fixed,tria_ema writes [drums_audio 256 | drums_rms 1 | drums_tria_fixed 2 | drums_tria_ema 2] (--controls first, then --features), so the 256-ch drum latent comes first and is named 'streamgen_latent' here so small_music_streamgen.json and the streamgen inference/eval scripts work unchanged, as for Slakh. An encode made without 'audio' has a 5-ch sidecar and needs the three-entry list [drums_rms, drums_tria_fixed, drums_tria_ema] / [1, 2, 2] instead. The model config names the one(s) it uses (streamgen_latent for the drum-audio arm, drums_rms for 3.3, drums_tria_fixed / drums_tria_ema for 3.4); the training wrapper attaches those and ignores the rest. Each sidecar also records chunk_index, n_chunks, chunk_offset (samples), chunk_offset_seconds and chunk_samples."
 }

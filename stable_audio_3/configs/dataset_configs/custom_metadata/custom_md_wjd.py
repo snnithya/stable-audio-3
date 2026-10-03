@@ -11,9 +11,9 @@ Called on a *target* stem in the tree ``scripts/wjd/make_stem_mirror.py`` writes
 Returns the prompt the mirror script decided on for that stem (short instrument names, e.g.
 ``"upright bass"`` or ``"trumpet, tenor saxophone"`` for ``other``) plus the drum control in
 one or more forms, chosen by the ``WJD_CONTROL_MODE`` environment variable, a comma-separated
-set of:
+set of (default: all four, ``audio,rms,tria_fixed,tria_ema``, matching sbatch/03_3_preencode_wjd.sbatch):
 
-    rms    (default)  ``__features__: {"drums_rms": [1, T_frames]}`` — the causal per-frame RMS
+    rms               ``__features__: {"drums_rms": [1, T_frames]}`` — the causal per-frame RMS
                       envelope of the drum stem at the latent rate, in [0, 1]. Pre-encode with
                       ``--features drums_rms``; train with ``controls: ["drums_rms"],
                       controls_dim: [1]``.  (stable_audio_3/data/features.py)
@@ -95,7 +95,7 @@ def parse_control_mode(value):
     return tuple(m for m in CONTROL_MODES if m in modes)
 
 
-CONTROL_MODE = os.environ.get("WJD_CONTROL_MODE", "rms")
+CONTROL_MODE = os.environ.get("WJD_CONTROL_MODE", "audio,rms,tria_fixed,tria_ema")
 MODES = parse_control_mode(CONTROL_MODE)
 
 FEATURE_KEY = "drums_rms"

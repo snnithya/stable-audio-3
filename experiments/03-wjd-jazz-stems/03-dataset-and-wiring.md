@@ -73,6 +73,26 @@ overlapping chunks as in sat-zenon's `ChunkedSampleDataset`, so:
   with it (136 train + 18 validation `drums_features.npz`, 23:21–23:24). Reasoning and the
   prior-weight caveat in 3.4.
 
+**All four controls in one encode (2026-10-03, Nithya):** the drum-*audio* arm (the original
+3.3 plan, drum stem → 256-ch VAE latent as the Slakh `streamgen_latent`) was not covered by the
+feature-only encode, and a separate encode for it would put that arm on different latents
+(polarity re-roll) and possibly a different item set. So the pre-encode default is now
+`WJD_CONTROL_MODE=audio,rms,tria_fixed,tria_ema` (sbatch and module), the sidecar is
+`[drums_audio 256 | drums_rms 1 | drums_tria_fixed 2 | drums_tria_ema 2]`, and the chunked
+training configs name the first block `streamgen_latent` so `small_music_streamgen.json` and
+the streamgen inference / eval scripts work unchanged. Finetune sbatch task 4 = `audio`
+(`small_music_streamgen.json`, group `03-3-wjd-drums-audio`). Reminders: the
+`dataset2preencoding` JSON's `controls` / `features` keys are read as defaults for the
+`--controls` / `--features` flags (CLI wins, and the sbatch always passes the flags), and they
+only say which module outputs to *write*; `WJD_CONTROL_MODE` says which the module *computes*,
+so the two must agree (the JSONs now carry `controls: [drums_audio]` + the three feature keys,
+matching the default). The drum latent is an audio control, not a feature, and
+`streamgen_latent` is a training-side name only. The training-side `controls` list must
+follow the sidecar order, `--controls` before `--features`. Encodes made before this (jobs 2534276, 2534336, 2534339) have the 5-ch
+feature-only sidecar and do not fit the new configs. Known cosmetic issue: the recursive latent
+scan also picks up `_sanity_check/*_feature_*.npy` (6 per stem dir); the loader catches the
+missing JSON and resamples, so training is unaffected, but `Found N files` is 24 too high.
+
 **Run log**
 
 | Date | What | Job | Notes |
@@ -81,7 +101,9 @@ overlapping chunks as in sat-zenon's `ChunkedSampleDataset`, so:
 | 2026-10-02 | song features, train + validation | (login node) | τ = 30 s, training-set stats for both splits |
 | 2026-10-02 | **chunked pre-encode, train** (commit `99335ba`) | **2534276** | 12 s → 130-frame windows, 50 % hop, `--pad --batch_size 8`, controls `[drums_rms, drums_tria_fixed, drums_tria_ema]` from the song files, 4 GPUs; output `wjd/preencoded-chunked/train/` |
 | | chunked pre-encode, validation | — | `SPLIT=validation sbatch sbatch/03_3_preencode_wjd.sbatch`, not yet run |
-| | finetunes (rms / tria_fixed / tria_ema) | — | `sbatch --array=2-3 sbatch/03_3_finetune_wjd.sbatch` for the TRIA arms once 2534276 is done |
+| 2026-10-02/03 | chunked pre-encode, train + validation, feature-only | 2534339 / 2534336 | re-runs after the output dir was removed; 5-ch sidecar, superseded by the all-four-controls default below |
+| | chunked pre-encode, train + validation, all four controls | — | `sbatch sbatch/03_3_preencode_wjd.sbatch` and `SPLIT=validation sbatch ...` with the new default; same output dirs, so cancel any feature-only run first |
+| | finetunes (rms / tria_fixed / tria_ema / audio) | — | `sbatch --array=0,2-4 sbatch/03_3_finetune_wjd.sbatch` once the all-controls encode is done |
 
 **Still to do:** the wiring table below on the real latents (step-0 no-op, gradient reaches the control, alignment by listening), then the finetune and its evaluation. Open knobs: conditioner frozen vs trainable (prompts vary here, unlike Slakh); demos cannot yet play the conditioning drums, since the RMS control is not decodable — a demo-side lookup of `tracks/drums/<track>/drums.flac` at `latent_crop_start` would fix that.
 

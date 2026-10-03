@@ -226,6 +226,8 @@ def _info(path, total_samples, valid_samples):
 
 
 def test_module_prompt_and_rms_feature(md, mirror_tree):
+    """Default mode (no WJD_CONTROL_MODE set) is all four controls, as the sbatch default."""
+    assert md.MODES == ("rms", "tria_fixed", "tria_ema", "audio")
     target = mirror_tree / "tracks" / "bass" / "A" / "bass.flac"
     total, valid = 4 * SR, 3 * SR
     out = md.get_custom_metadata(_info(target, total, valid), torch.zeros(2, total))
@@ -235,7 +237,10 @@ def test_module_prompt_and_rms_feature(md, mirror_tree):
     assert feat.shape == (1, frames_for(total))
     assert torch.all(feat[0, : frames_for(valid) - 1] > 0.5)
     assert torch.all(feat[0, frames_for(valid):] == 0)
-    assert "__audio__" not in out
+    assert set(out["__features__"]) == {"drums_rms", "drums_tria_fixed", "drums_tria_ema"}
+    drums = out["__audio__"]["drums_audio"]
+    assert drums.shape == (2, total)
+    assert torch.all(drums[:, valid:] == 0)
 
 
 def test_module_other_stem_gets_front_line_prompt(md, mirror_tree):

@@ -3,7 +3,7 @@
 #SBATCH --partition=hai-res-l40s
 #SBATCH --qos=hai-res-main
 #SBATCH --account=hai-res
-#SBATCH --gres=gpu:l40s:1
+#SBATCH --gres=gpu:l40s:2
 #SBATCH --ntasks=4
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=96G
@@ -39,11 +39,16 @@
 # scripts/wjd/compute_drum_features.py, run below on the job's CPUs before the encode; existing
 # files are kept). WJD_DRUM_FEATURES=audio computes them from the window's drum audio instead.
 #
-# WJD_CONTROL_MODE picks what custom_md_wjd.py returns, as a comma-separated set: rms
-# (--features drums_rms), tria_fixed / tria_ema (--features drums_tria_*, experiment 3.4's
-# causal TRIA controls, which need configs/dataset_configs/features/wjd_drums_tria_stats.json),
-# audio (--controls drums_audio, the VAE-latent condition as in Slakh); 'both' = rms,audio.
-# Default: rms,tria_fixed,tria_ema, the layout preencoded/wjd_stems_*_preencoded.json expects.
+# WJD_CONTROL_MODE picks what custom_md_wjd.py returns, as a comma-separated set: audio
+# (--controls drums_audio: the drum stem VAE-encoded to a 256-ch latent, the Slakh-style
+# streamgen condition), rms (--features drums_rms), tria_fixed / tria_ema (--features
+# drums_tria_*, experiment 3.4's causal TRIA controls, which need
+# configs/dataset_configs/features/wjd_drums_tria_stats.json); 'both' = rms,audio.
+# Default (2026-10-03): audio,rms,tria_fixed,tria_ema, i.e. every control the four finetune arms
+# need in ONE sidecar, laid out [drums_audio 256 | drums_rms 1 | drums_tria_fixed 2 |
+# drums_tria_ema 2] (--controls first, then --features, the pre-encode's fixed order). That is
+# the layout preencoded/wjd_stems_*_chunked_preencoded.json names (the 256-ch block as
+# 'streamgen_latent'). The audio control roughly doubles the VAE work per item.
 
 set -euo pipefail
 
@@ -53,7 +58,7 @@ SPLIT=${SPLIT:-train}
 MODEL=${MODEL:-same-s}
 CHUNK_SECONDS=${CHUNK_SECONDS:-12}
 CHUNK_HOP_RATIO=${CHUNK_HOP_RATIO:-0.5}
-export WJD_CONTROL_MODE=${WJD_CONTROL_MODE:-rms,tria_fixed,tria_ema}
+export WJD_CONTROL_MODE=${WJD_CONTROL_MODE:-audio,rms,tria_fixed,tria_ema}
 export WJD_DRUM_FEATURES=${WJD_DRUM_FEATURES:-precomputed}
 MIRROR=/data/hai-res/shared/snnithya/sao-3/data/wjd/wjd-stem-mirror
 
@@ -108,7 +113,7 @@ else
 fi
 echo "window: ${WINDOW[*]}"
 
-srun --ntasks=1 --gpus-per-task=1 \
+srun --ntasks=2 --gpus-per-task=1 \
      --output=/data/scratch-fast/snnithya/sao-3/logs/03_3_preencode_wjd_%j_%t.out \
      "$PYTHON" scripts/pre_encode_dataset.py \
     --dataset_config "stable_audio_3/configs/dataset_configs/dataset2preencoding/wjd_stems_${SPLIT}.json" \
