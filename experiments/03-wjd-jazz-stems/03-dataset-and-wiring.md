@@ -30,7 +30,7 @@ Taken before the build; they override the original plan below where the two diff
 
 - `stable_audio_3/training/diffusion.py`: `_add_streamgen_conditioning` now attaches **every** modular local cond the model config names, except the masks the training step builds itself (`control_cond_ids()`); the method keeps its name and `streamgen_latent` behaves as before. The demo callback decodes a control to audio only when its channel count equals the DiT's latent width, so a 1-ch feature control is skipped rather than fed to the autoencoder. `tests/test_control_conditioning.py`.
 - `model_configs/small_music_wjd_drums_rms.json` — `small_music_streamgen.json` with `{"id": "drums_rms", "dim": 1}` in place of the 256-ch accompaniment; nothing else changed, so the run is comparable to 1.2.
-- `sbatch/03_3_finetune_wjd.sbatch` — task 0 = the rms run (`small-music`, 20k steps, batch 8 × accum 2, lr 1e-5, seed 42, conditioner frozen, causal inpainting task with `future_visibility [-4, 0]` as in 1.2); task 1 = text-only baseline (`small_music_baseline.json`), not run by default.
+- `sbatch/03_3_finetune_wjd_<arm>.sbatch` (split into one script per arm on 2026-10-03 so each can run under its own QoS; shared body in `03_3_finetune_wjd_common.sh`; originally one array script) — `rms` = the rms run (`small-music`, 20k steps, batch 8 × accum 2, lr 1e-5, seed 42, conditioner frozen, causal inpainting task with `future_visibility [-4, 0]` as in 1.2); `base` = text-only baseline (`small_music_baseline.json`).
 - Smoke-tested on the real train latents (bass/other/piano written, guitar partial): 4 steps at batch 2 plus one demo round at cfg 4 ran end to end with `drums_rms` in every batch's conditioning (a missing control raises).
 
 **Encode redone as chunks (decided 2026-10-02, Nithya):** the whole-track encode above caps
@@ -80,7 +80,7 @@ feature-only encode, and a separate encode for it would put that arm on differen
 `WJD_CONTROL_MODE=audio,rms,tria_fixed,tria_ema` (sbatch and module), the sidecar is
 `[drums_audio 256 | drums_rms 1 | drums_tria_fixed 2 | drums_tria_ema 2]`, and the chunked
 training configs name the first block `streamgen_latent` so `small_music_streamgen.json` and
-the streamgen inference / eval scripts work unchanged. Finetune sbatch task 4 = `audio`
+the streamgen inference / eval scripts work unchanged. Finetune script `03_3_finetune_wjd_audio.sbatch`
 (`small_music_streamgen.json`, group `03-3-wjd-drums-audio`). Reminders: the
 `dataset2preencoding` JSON's `controls` / `features` keys are read as defaults for the
 `--controls` / `--features` flags (CLI wins, and the sbatch always passes the flags), and they
@@ -103,7 +103,7 @@ missing JSON and resamples, so training is unaffected, but `Found N files` is 24
 | | chunked pre-encode, validation | — | `SPLIT=validation sbatch sbatch/03_3_preencode_wjd.sbatch`, not yet run |
 | 2026-10-02/03 | chunked pre-encode, train + validation, feature-only | 2534339 / 2534336 | re-runs after the output dir was removed; 5-ch sidecar, superseded by the all-four-controls default below |
 | | chunked pre-encode, train + validation, all four controls | — | `sbatch sbatch/03_3_preencode_wjd.sbatch` and `SPLIT=validation sbatch ...` with the new default; same output dirs, so cancel any feature-only run first |
-| | finetunes (rms / tria_fixed / tria_ema / audio) | — | `sbatch --array=0,2-4 sbatch/03_3_finetune_wjd.sbatch` once the all-controls encode is done |
+| | finetunes (rms / tria_fixed / tria_ema / audio) | — | `sbatch sbatch/03_3_finetune_wjd_<arm>.sbatch`, one per arm (own `--qos` each), once the all-controls encode is done |
 
 **Still to do:** the wiring table below on the real latents (step-0 no-op, gradient reaches the control, alignment by listening), then the finetune and its evaluation. Open knobs: conditioner frozen vs trainable (prompts vary here, unlike Slakh); demos cannot yet play the conditioning drums, since the RMS control is not decodable — a demo-side lookup of `tracks/drums/<track>/drums.flac` at `latent_crop_start` would fix that.
 

@@ -71,7 +71,7 @@ moment that frame's audio has arrived.
 - Configs: `model_configs/small_music_wjd_drums_tria_{fixed,ema}.json` (the rms config with
   `{"id": "drums_tria_*", "dim": 2}`); `preencoded/wjd_stems_*_preencoded.json` now lists all
   three sidecar keys (`controls_dim [1, 2, 2]`; PreEncodedDataset splits by position, the
-  model config names what it uses); `sbatch/03_3_finetune_wjd.sbatch` tasks 2 and 3;
+  model config names what it uses); `sbatch/03_3_finetune_wjd_tria_{fixed,ema}.sbatch` (one script per arm since 2026-10-03, shared body `03_3_finetune_wjd_common.sh`);
   `sbatch/03_3_preencode_wjd.sbatch` defaults to all three features.
 
 ### Runs
@@ -80,9 +80,9 @@ Same items, same evaluation as 3.3 (rhythmic lock, prompt selectivity, listening
 
 | Run | Control | Channels | Status |
 |---|---|---|---|
-| 3.3 rms | causal drum RMS, absolute dBFS | 1 | not yet submitted (sbatch task 0) |
-| T1-fixed | TRIA bands, dataset normalisation | 2 | prepared (sbatch task 2); waiting on the chunked train encode, job 2534276 (2026-10-02) |
-| T1-ema | TRIA bands, EMA normalisation, τ = 30 s | 2 | prepared (sbatch task 3); same |
+| 3.3 rms | causal drum RMS, absolute dBFS | 1 | not yet submitted (`03_3_finetune_wjd_rms.sbatch`) |
+| T1-fixed | TRIA bands, dataset normalisation | 2 | prepared (`03_3_finetune_wjd_tria_fixed.sbatch`); waiting on the all-controls train encode |
+| T1-ema | TRIA bands, EMA normalisation, τ = 30 s | 2 | prepared (`03_3_finetune_wjd_tria_ema.sbatch`); same |
 
 All three train on the chunked encode (12 s windows, 50 % hop, `wjd_stems_train_chunked_preencoded.json`),
 so the whole-track sidecars with TRIA keys appended earlier on 2026-10-02 are not used.
