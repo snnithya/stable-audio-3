@@ -1,9 +1,14 @@
 #!/bin/bash
-# Shared body of the WJD finetune jobs (experiments 3.3 / 3.4). Not submitted directly:
+# Bootstrap of the WJD finetune jobs (experiments 3.3 / 3.4). Not submitted directly:
 # sbatch/03_3_finetune_wjd_<arm>.sbatch sets ARM, MODEL_CONFIG and GROUP and sources this
 # file by its absolute path (Slurm runs a copy of the batch script from its spool dir, so
 # $0 / BASH_SOURCE would not point here). One script per arm so each can carry its own
-# #SBATCH --qos / partition / time; everything the arms share lives here once.
+# #SBATCH --qos / partition / time.
+#
+# This file is read from the live checkout because it is what picks the run to continue,
+# the git ref to pin, and makes the clone; keep it to that. The training flags live in
+# sbatch/03_3_finetune_wjd_train.sh, which is sourced from the pinned clone, so edits to
+# the flags take effect only once committed, like the rest of the code.
 #
 # Mirrors 01_2_finetune.sbatch: same pretrained small-music, same causal inpainting task,
 # same optimizer, same seed. Items are 12 s chunks (130 frames) from the chunked encode
@@ -53,12 +58,24 @@ mkdir -p /data/scratch-fast/snnithya/sao-3/logs
 #  * the git ref is recorded next to the run on first start and reused, so a requeue does
 #    not pick up commits made in the meantime;
 #  * --resume_ckpt is passed whenever that dir already holds a last.ckpt.
-# To continue a run by hand (e.g. after the 24 h MaxWall of hai-res-main), resubmit with its
-# id:  WANDB_RUN_ID=wjd-rms-2534900 sbatch sbatch/03_3_finetune_wjd_rms.sbatch
+# A plain resubmit (e.g. after the 24 h MaxWall of hai-res-main) continues too: with no
+# WANDB_RUN_ID given, the arm's most recent run that already has a last.ckpt is reused, so
+# nothing starts over by accident (jobs 2539647-49, 2026-10-03, did exactly that). To pick
+# a specific run:  WANDB_RUN_ID=wjd-rms-2534900 sbatch sbatch/03_3_finetune_wjd_rms.sbatch
+# To start a new run next to existing ones:  FRESH=1 sbatch sbatch/03_3_finetune_wjd_rms.sbatch
+WANDB_PROJECT_NAME=sao-3
+ARM_DIR=${SAVE_BASE}/${GROUP}/${ARM}/${WANDB_PROJECT_NAME}
+if [ -z "${WANDB_RUN_ID:-}" ] && [ "${FRESH:-0}" != 1 ]; then
+    # `|| true`: with no match ls fails and pipefail + set -e would abort the job here.
+    latest_ckpt=$(ls -t "$ARM_DIR"/*/checkpoints/last.ckpt 2>/dev/null | head -1 || true)
+    if [ -n "$latest_ckpt" ]; then
+        WANDB_RUN_ID=$(basename "$(dirname "$(dirname "$latest_ckpt")")")
+        echo "no WANDB_RUN_ID given: continuing the arm's latest run ${WANDB_RUN_ID} (FRESH=1 to start over)"
+    fi
+fi
 export WANDB_RUN_ID=${WANDB_RUN_ID:-wjd-${ARM}-${SLURM_JOB_ID:-local}}
 export WANDB_RESUME=allow
-WANDB_PROJECT_NAME=sao-3
-RUN_DIR=${SAVE_BASE}/${GROUP}/${ARM}/${WANDB_PROJECT_NAME}/${WANDB_RUN_ID}
+RUN_DIR=${ARM_DIR}/${WANDB_RUN_ID}
 mkdir -p "$RUN_DIR"
 REF_FILE=$RUN_DIR/sao_ref
 if [ -f "$REF_FILE" ]; then
@@ -88,58 +105,12 @@ cd "$WORKDIR/stable-audio-3"
 PYTHON="$REPO/.venv/bin/python"
 export PYTHONPATH="$PWD"
 
-# Chunked encode by default (2026-10-02); DATASET_CONFIG=.../wjd_stems_train_preencoded.json
-# selects the earlier whole-track one.
-DATASET_CONFIG=${DATASET_CONFIG:-stable_audio_3/configs/dataset_configs/preencoded/wjd_stems_train_chunked_preencoded.json}
-
-SAVE_ROOT=${SAVE_BASE}/${GROUP}
-
-# Effective batch (samples per optimizer step) is fixed at EFFECTIVE_BATCH; the per-GPU
-# batch defaults to EFFECTIVE_BATCH / NGPU with no gradient accumulation, i.e. the whole
-# step is one forward/backward spread over the GPUs the arm's header requested (items are
-# 130 latent frames, so a large per-GPU batch fits). --batch_size is PER GPU under Lightning
-# DDP, which is why it is derived here rather than written once for every GPU count.
-# If a per-GPU batch of EFFECTIVE_BATCH / NGPU runs out of memory, force a smaller one and
-# the difference is made up by accumulation:  MICRO_BATCH=32 sbatch sbatch/03_3_finetune_wjd_rms.sbatch
-EFFECTIVE_BATCH=${EFFECTIVE_BATCH:-256}
-NGPU=${SLURM_GPUS_ON_NODE:-$(nvidia-smi -L | wc -l)}
-if (( EFFECTIVE_BATCH % NGPU != 0 )); then
-    echo "EFFECTIVE_BATCH=${EFFECTIVE_BATCH} is not a multiple of NGPU=${NGPU}" >&2
-    exit 2
+# From here on, run the sbatch logic of the pinned commit, not of the live checkout: the
+# training flags live in sbatch/03_3_finetune_wjd_train.sh inside the clone. Runs pinned to
+# a commit older than that file fall back to the checkout's copy.
+TRAIN_SH=$PWD/sbatch/03_3_finetune_wjd_train.sh
+if [ ! -f "$TRAIN_SH" ]; then
+    TRAIN_SH=$REPO/sbatch/03_3_finetune_wjd_train.sh
+    echo "NOTE: ${SAO_REF} predates sbatch/03_3_finetune_wjd_train.sh; using the checkout's copy."
 fi
-MICRO_BATCH=${MICRO_BATCH:-$(( EFFECTIVE_BATCH / NGPU ))}
-if (( EFFECTIVE_BATCH % (MICRO_BATCH * NGPU) != 0 )); then
-    echo "EFFECTIVE_BATCH=${EFFECTIVE_BATCH} is not a multiple of MICRO_BATCH x NGPU = ${MICRO_BATCH} x ${NGPU}" >&2
-    exit 2
-fi
-ACCUM=$(( EFFECTIVE_BATCH / (MICRO_BATCH * NGPU) ))
-
-echo "host=$(hostname) arm=${ARM} config=${MODEL_CONFIG} ref=${SAO_REF} started=$(date -Is)"
-echo "gpus=${NGPU} micro_batch=${MICRO_BATCH} accum=${ACCUM} -> effective batch $(( MICRO_BATCH * NGPU * ACCUM )) per optimizer step"
-nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
-
-"$PYTHON" scripts/train_finetune.py \
-    --model small-music \
-    --model_config "${MODEL_CONFIG}" \
-    --dataset_config "${DATASET_CONFIG}" \
-    --steps 100000 \
-    --batch_size "${MICRO_BATCH}" \
-    --accum_batches "${ACCUM}" \
-    --lr 1e-5 \
-    --lr_schedule inverse --lr_inv_gamma 1000000 --lr_power 0.5 --lr_warmup_decay 0.995 \
-    --seed 42 \
-    --freeze_conditioner \
-    --num_workers 12 \
-    --checkpoint_every 5000 \
-    --demo_every 1000 \
-    --log_every 50 \
-    --export_safetensors \
-    --logger wandb \
-    --project "${WANDB_PROJECT_NAME}" \
-    --resume_every 1000 \
-    "${RESUME[@]}" \
-    --group "${GROUP}" \
-    --name "wjd-${ARM}" \
-    --save_dir "${SAVE_ROOT}/${ARM}"
-
-echo "finished=$(date -Is)"
+source "$TRAIN_SH"

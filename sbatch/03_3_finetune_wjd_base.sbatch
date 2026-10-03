@@ -18,7 +18,8 @@
 #   sbatch --qos=<other> sbatch/03_3_finetune_wjd_base.sbatch   # or edit the --qos line above
 #
 # One file per arm so each can run under its own QoS. Everything else is shared:
-# sbatch/03_3_finetune_wjd_common.sh (training flags, checkout clone, save dir).
+# sbatch/03_3_finetune_wjd_common.sh (run to continue, git ref pin, clone; read from the
+# checkout) and sbatch/03_3_finetune_wjd_train.sh (training flags; read from the pinned clone).
 
 ARM=base
 MODEL_CONFIG=stable_audio_3/configs/model_configs/small_music_baseline.json
