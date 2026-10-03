@@ -1,6 +1,6 @@
 # 3.3 — Dataset build, wiring, and the drum-latent finetune
 
-**Status:** **mirror built, wiring written and unit-tested** (2026-10-01); whole-track pre-encode run 2026-10-01 (train), superseded by the chunked encode decided 2026-10-02 (see below); finetune not run
+**Status:** **mirror built, wiring written and unit-tested** (2026-10-01); whole-track pre-encode run 2026-10-01 (train), superseded by the **chunked encode, submitted 2026-10-02 (job 2534276, train split)**; finetune not run
 **Depends on:** 3.1 (aligned audio), 3.2 (stems — done, 166 tracks, BS-Roformer-SW).
 
 ## Decisions 2026-10-01 (Nithya)
@@ -67,6 +67,21 @@ overlapping chunks as in sat-zenon's `ChunkedSampleDataset`, so:
   chunk as a live stream would, instead of restarting from the prior per chunk.
   `WJD_DRUM_FEATURES=audio` keeps the per-window computation. The pre-encode sbatch runs the
   script (skipping existing files) before the encode. `tests/test_drum_features_precompute.py`.
+- **EMA time constant set to 30 s** (Nithya, 2026-10-02; the stats script's default was 4 s). The
+  stats file is the only place it lives; the split frequency and band statistics do not depend
+  on it, so `tria_feature_stats.py` was not rerun. Song features for both splits were computed
+  with it (136 train + 18 validation `drums_features.npz`, 23:21–23:24). Reasoning and the
+  prior-weight caveat in 3.4.
+
+**Run log**
+
+| Date | What | Job | Notes |
+|---|---|---|---|
+| 2026-10-01 | whole-track pre-encode, train, `drums_rms` only | 2516883 | 428 items, 380 s cap; TRIA keys appended 2026-10-02 with `add_features_to_preencoded.py`; superseded |
+| 2026-10-02 | song features, train + validation | (login node) | τ = 30 s, training-set stats for both splits |
+| 2026-10-02 | **chunked pre-encode, train** (commit `99335ba`) | **2534276** | 12 s → 130-frame windows, 50 % hop, `--pad --batch_size 8`, controls `[drums_rms, drums_tria_fixed, drums_tria_ema]` from the song files, 4 GPUs; output `wjd/preencoded-chunked/train/` |
+| | chunked pre-encode, validation | — | `SPLIT=validation sbatch sbatch/03_3_preencode_wjd.sbatch`, not yet run |
+| | finetunes (rms / tria_fixed / tria_ema) | — | `sbatch --array=2-3 sbatch/03_3_finetune_wjd.sbatch` for the TRIA arms once 2534276 is done |
 
 **Still to do:** the wiring table below on the real latents (step-0 no-op, gradient reaches the control, alignment by listening), then the finetune and its evaluation. Open knobs: conditioner frozen vs trainable (prompts vary here, unlike Slakh); demos cannot yet play the conditioning drums, since the RMS control is not decodable — a demo-side lookup of `tracks/drums/<track>/drums.flac` at `latent_crop_start` would fix that.
 

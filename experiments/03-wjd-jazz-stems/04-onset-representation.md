@@ -1,6 +1,6 @@
 # 3.4 — Drum onset representation as the condition
 
-**Status:** **TRIA control built and unit-tested (2026-10-02)**; finetunes T1-fixed / T1-ema prepared (see the decisions below). The onset/activation representations further down are still planned.
+**Status:** **TRIA control built and unit-tested (2026-10-02)**; per-song features computed (τ = 30 s); chunked train encode running (job 2534276); finetunes T1-fixed / T1-ema prepared, not submitted. The onset/activation representations further down are still planned.
 **Depends on:** 3.3 (the drum-RMS finetune is the reference row)
 
 ## Decisions 2026-10-02 (Nithya): TRIA features first, at the latent rate
@@ -22,6 +22,8 @@ normalised, coarsely quantised loudness envelope, i.e. a small generalisation of
 | Normalisation | **Both**: `tria_fixed` (training-set mean/std per band) and `tria_ema` (causal running statistics) | Two arms, T1-fixed and T1-ema; T2/T3 (sub-frame variants) dropped |
 | Split frequency | Fixed corpus constant (median equal-energy frequency of the training drum stems) | Measured by `scripts/wjd/tria_feature_stats.py`, stored in `configs/dataset_configs/features/wjd_drums_tria_stats.json` |
 | Augmentations | Not in this round | TRIA's robustness augmentations matter for live beatbox/pad input; phase 2 |
+| EMA time constant | **30 s** (Nithya, later on 2026-10-02; the measured-stats default was 4 s) | Exponential window: the first frame of a song weighs 37 % after 30 s, 5 % after 90 s, under 1 % after 2.5 min; a frame near the end of a 5-min track is normalised by its last 2–3 min. The prior weight defaults to one τ, so chunks from a song's first ~30 s are normalised mostly against the training-set constants (close to `fixed`); a separate prior weight is a one-field change if a faster hand-over is wanted. 4 s would track the last ~12 s (one chunk, flattens section dynamics); 10 s the last ~30 s (a chorus). |
+| Feature source | **Per song, sliced per chunk** (`compute_drum_features.py`, `WJD_DRUM_FEATURES=precomputed`) | With 12 s chunks the EMA still sees the whole song before the chunk; the crossover has no start-up transient at chunk starts. Both match a stateful real-time extractor that starts at the song's start (a `TriaStream` class + parity test is the planned inference piece). |
 
 ### Making TRIA causal
 
@@ -78,9 +80,12 @@ Same items, same evaluation as 3.3 (rhythmic lock, prompt selectivity, listening
 
 | Run | Control | Channels | Status |
 |---|---|---|---|
-| 3.3 rms | causal drum RMS, absolute dBFS | 1 | not yet submitted |
-| T1-fixed | TRIA bands, dataset normalisation | 2 | prepared (sbatch task 2) |
-| T1-ema | TRIA bands, EMA normalisation | 2 | prepared (sbatch task 3) |
+| 3.3 rms | causal drum RMS, absolute dBFS | 1 | not yet submitted (sbatch task 0) |
+| T1-fixed | TRIA bands, dataset normalisation | 2 | prepared (sbatch task 2); waiting on the chunked train encode, job 2534276 (2026-10-02) |
+| T1-ema | TRIA bands, EMA normalisation, τ = 30 s | 2 | prepared (sbatch task 3); same |
+
+All three train on the chunked encode (12 s windows, 50 % hop, `wjd_stems_train_chunked_preencoded.json`),
+so the whole-track sidecars with TRIA keys appended earlier on 2026-10-02 are not used.
 
 One probe specific to this control once an arm is trained: lower the whole drum stem by 12 dB
 and re-generate. `fixed` should follow the level (quieter, sparser output); `ema` should not

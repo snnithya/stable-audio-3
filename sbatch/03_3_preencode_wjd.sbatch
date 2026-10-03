@@ -3,7 +3,7 @@
 #SBATCH --partition=hai-res-l40s
 #SBATCH --qos=hai-res-main
 #SBATCH --account=hai-res
-#SBATCH --gres=gpu:l40s:4
+#SBATCH --gres=gpu:l40s:1
 #SBATCH --ntasks=4
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=96G
@@ -108,7 +108,7 @@ else
 fi
 echo "window: ${WINDOW[*]}"
 
-srun --ntasks=4 --gpus-per-task=1 \
+srun --ntasks=1 --gpus-per-task=1 \
      --output=/data/scratch-fast/snnithya/sao-3/logs/03_3_preencode_wjd_%j_%t.out \
      "$PYTHON" scripts/pre_encode_dataset.py \
     --dataset_config "stable_audio_3/configs/dataset_configs/dataset2preencoding/wjd_stems_${SPLIT}.json" \
