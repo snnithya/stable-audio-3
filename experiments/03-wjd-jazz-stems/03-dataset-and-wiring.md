@@ -26,7 +26,14 @@ Taken before the build; they override the original plan below where the two diff
 - `scripts/pre_encode_dataset.py --num_shards/--shard_index` — one process per GPU, defaulting from the srun step; shards take interleaved global batch indices so ids and files are those of a single-GPU run; per-shard `_skipped.shard<k>of<N>.json` merged into `_skipped.json`. Checked on two real tracks against a single-process run: controls and 3 of 4 latents bit-identical, the 4th differs only by the pre-existing random `PhaseFlipper` (p = 0.5) that `SampleDataset` applies to the target at load time (see Notes).
 - Configs `dataset2preencoding/wjd_stems_{train,validation}.json` (four entries, one per target dir → `preencoded/<split>/{bass,other,piano,guitar}/`) and `preencoded/wjd_stems_{train,validation}_preencoded.json` (`controls: ["drums_rms"], controls_dim: [1]`, crop 144, random crop on train). `sbatch/03_3_preencode_wjd.sbatch`.
 
-**Still to do before a finetune:** (1) run the pre-encode (sbatch above, ~2 GPU-h); (2) generalise `_add_streamgen_conditioning` in `stable_audio_3/training/diffusion.py` — it hardcodes the `streamgen_latent` id, so `drums_rms` never reaches the model until it loops over `modular_local_cond_ids` instead; (3) a `small_music_wjd_drums.json` model config with `{"id": "drums_rms", "dim": 1}`; (4) the wiring table below.
+**Training wiring (added later on 2026-10-01, while the pre-encode ran as job 2516883):**
+
+- `stable_audio_3/training/diffusion.py`: `_add_streamgen_conditioning` now attaches **every** modular local cond the model config names, except the masks the training step builds itself (`control_cond_ids()`); the method keeps its name and `streamgen_latent` behaves as before. The demo callback decodes a control to audio only when its channel count equals the DiT's latent width, so a 1-ch feature control is skipped rather than fed to the autoencoder. `tests/test_control_conditioning.py`.
+- `model_configs/small_music_wjd_drums_rms.json` — `small_music_streamgen.json` with `{"id": "drums_rms", "dim": 1}` in place of the 256-ch accompaniment; nothing else changed, so the run is comparable to 1.2.
+- `sbatch/03_3_finetune_wjd.sbatch` — task 0 = the rms run (`small-music`, 20k steps, batch 8 × accum 2, lr 1e-5, seed 42, conditioner frozen, causal inpainting task with `future_visibility [-4, 0]` as in 1.2); task 1 = text-only baseline (`small_music_baseline.json`), not run by default.
+- Smoke-tested on the real train latents (bass/other/piano written, guitar partial): 4 steps at batch 2 plus one demo round at cfg 4 ran end to end with `drums_rms` in every batch's conditioning (a missing control raises).
+
+**Still to do:** the wiring table below on the real latents (step-0 no-op, gradient reaches the control, alignment by listening), then the finetune and its evaluation. Open knobs: conditioner frozen vs trainable (prompts vary here, unlike Slakh); demos cannot yet play the conditioning drums, since the RMS control is not decodable — a demo-side lookup of `tracks/drums/<track>/drums.flac` at `latent_crop_start` would fix that.
 
 ## Question
 

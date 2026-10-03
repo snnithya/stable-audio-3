@@ -258,39 +258,56 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
 
         return [opt_diff]
 
-    def _add_streamgen_conditioning(self, conditioning, metadata, tf_inpaint_mask):
-        """Attach the accompaniment ("streamgen") latent to the conditioning dict.
+    # Modular local conds that the training step builds itself rather than reading from the
+    # pre-encoded control sidecar.
+    INTERNAL_LOCAL_CONDS = ("tf_inpaint_mask", "inpaint_mask", "inpaint_masked_input")
 
-        The latent is a pre-encoded control produced alongside the audio latents and split
-        out by PreEncodedDataset into info["controls"]. It is injected here rather than via
-        a Conditioner because the gating mask is only generated at this point.
+    def control_cond_ids(self):
+        """Modular local cond ids that come from the pre-encoded controls sidecar.
 
-        Note the polarity: the inpainting conds are multiplied by (1 - mask), but the
-        accompaniment is multiplied by tf_inpaint_mask itself, so it is visible in the
-        context region and up to the lookahead horizon, and hidden beyond it. That gating is
-        the whole point - without it the model would see the future accompaniment and the
-        condition would stop being causal.
+        Everything the model config lists under modular_local_cond_configs except the masks
+        the training step generates itself: the Slakh accompaniment latent (`streamgen_latent`,
+        256 ch), the WJD drum RMS envelope (`drums_rms`, 1 ch), or whatever the next
+        experiment adds. The dataset config's `controls`/`controls_dim` must name the same ids.
         """
-        if "streamgen_latent" not in self.diffusion.modular_local_cond_ids:
-            return
+        return [
+            cid for cid in self.diffusion.modular_local_cond_ids
+            if cid not in self.INTERNAL_LOCAL_CONDS
+        ]
 
-        missing = [i for i, m in enumerate(metadata) if "streamgen_latent" not in m.get("controls", {})]
-        if missing:
-            raise ValueError(
-                f"streamgen_latent is configured as a modular local cond but is missing from "
-                f"info['controls'] for {len(missing)}/{len(metadata)} items in the batch. "
-                f"Check that the dataset config lists it under 'controls'/'controls_dim' and that "
-                f"the *_controls.npy sidecars exist."
-            )
+    def _add_streamgen_conditioning(self, conditioning, metadata, tf_inpaint_mask):
+        """Attach the frame-rate controls (accompaniment latent, drum RMS, ...) to the conditioning dict.
 
-        streamgen = torch.stack(
-            [m["controls"]["streamgen_latent"] for m in metadata], dim=0
-        ).to(self.device)
+        Each control is a pre-encoded signal produced alongside the audio latents and split
+        out by PreEncodedDataset into info["controls"] under its id. They are injected here
+        rather than via a Conditioner because the gating mask is only generated at this point.
+        The method keeps its historical name; it handles every id `control_cond_ids` returns,
+        not just `streamgen_latent`.
 
-        if tf_inpaint_mask is not None:
-            streamgen = streamgen * tf_inpaint_mask
+        Note the polarity: the inpainting conds are multiplied by (1 - mask), but a control
+        is multiplied by tf_inpaint_mask itself, so it is visible in the context region and up
+        to the lookahead horizon, and hidden beyond it. That gating is the whole point -
+        without it the model would see the future accompaniment and the condition would stop
+        being causal.
+        """
+        for cond_id in self.control_cond_ids():
+            missing = [i for i, m in enumerate(metadata) if cond_id not in m.get("controls", {})]
+            if missing:
+                raise ValueError(
+                    f"{cond_id} is configured as a modular local cond but is missing from "
+                    f"info['controls'] for {len(missing)}/{len(metadata)} items in the batch. "
+                    f"Check that the dataset config lists it under 'controls'/'controls_dim' and that "
+                    f"the *_controls.npy sidecars exist."
+                )
 
-        conditioning["streamgen_latent"] = [streamgen]
+            control = torch.stack(
+                [m["controls"][cond_id] for m in metadata], dim=0
+            ).to(self.device)
+
+            if tf_inpaint_mask is not None:
+                control = control * tf_inpaint_mask
+
+            conditioning[cond_id] = [control]
 
     def training_step(self, batch, batch_idx):
         reals, metadata = batch # reals (bs, 256, 256)
@@ -1133,17 +1150,27 @@ class DiffusionCondInpaintDemoCallback(pl.Callback):
                 )
                 del prefix_decoded, unique_masked
 
-                if 'streamgen_latent' in conditioning:
-                    # Already gated by tf_mask in _add_streamgen_conditioning, so this is
-                    # exactly what the model sees, silence beyond the lookahead included.
-                    # It differs per tf value, so unlike the target it stays per row.
-                    streamgen_latent = conditioning['streamgen_latent'][0].to(pt_dtype)
-                    streamgen_decoded = pretransform.decode(streamgen_latent) if pretransform is not None else streamgen_latent
+                # A control that is itself an audio latent (the Slakh accompaniment, 256 ch)
+                # is decoded so the demo table carries what the model was following. Already
+                # gated by tf_mask in _add_streamgen_conditioning, so this is exactly what the
+                # model sees, silence beyond the lookahead included; it differs per tf value,
+                # so unlike the target it stays per row. A low-dimensional feature control
+                # (the WJD drum RMS, 1 ch) has no audio to decode and is skipped here.
+                latent_dim = module.diffusion.io_channels  # the DiT works in latent space
+                for cond_id in module.control_cond_ids():
+                    if cond_id not in conditioning:
+                        continue
+                    control = conditioning[cond_id][0]
+                    if control.shape[1] != latent_dim:
+                        continue
+                    control = control.to(pt_dtype)
+                    control_decoded = pretransform.decode(control) if pretransform is not None else control
                     streamgen_paths = save_demo_wavs(
-                        streamgen_decoded, 'demo_streamgen', trainer.global_step,
+                        control_decoded, f'demo_{cond_id}', trainer.global_step,
                         self.sample_rate, demo_dir, per_elem_trim
                     )
-                    del streamgen_decoded
+                    del control_decoded
+                    break
             torch.cuda.empty_cache()
 
         def _reference_path(paths, row):

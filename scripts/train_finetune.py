@@ -258,10 +258,15 @@ def train(args):
         save_last=True,
     )
 
+    # A fixed but *shuffled* demo batch: file order groups a dataset by directory (the WJD
+    # mirror lists every bass item before the first piano one), so the first four files
+    # would all share a prompt and the demos could never show the prompt selecting the
+    # stem. Seeded, so the same four items are demoed at every step and across runs.
     demo_dl = torch.utils.data.DataLoader(
         dataset,
         batch_size=4,
-        shuffle=False,
+        shuffle=True,
+        generator=torch.Generator().manual_seed(seed),
         num_workers=0,
         drop_last=True,
         collate_fn=collation_fn,
