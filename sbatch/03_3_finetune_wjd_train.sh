@@ -51,7 +51,6 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
     --checkpoint_every 5000 \
     --demo_every 1000 \
     --log_every 50 \
-    --export_safetensors \
     --logger wandb \
     --project "${WANDB_PROJECT_NAME}" \
     --resume_every 1000 \
