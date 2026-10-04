@@ -19,7 +19,7 @@ SAVE_ROOT=${SAVE_BASE}/${GROUP}
 # DDP, which is why it is derived here rather than written once for every GPU count.
 # If a per-GPU batch of EFFECTIVE_BATCH / NGPU runs out of memory, force a smaller one and
 # the difference is made up by accumulation:  MICRO_BATCH=32 sbatch sbatch/03_3_finetune_wjd_rms.sbatch
-EFFECTIVE_BATCH=${EFFECTIVE_BATCH:-256}
+EFFECTIVE_BATCH=${EFFECTIVE_BATCH:-768}
 NGPU=${SLURM_GPUS_ON_NODE:-$(nvidia-smi -L | wc -l)}
 if (( EFFECTIVE_BATCH % NGPU != 0 )); then
     echo "EFFECTIVE_BATCH=${EFFECTIVE_BATCH} is not a multiple of NGPU=${NGPU}" >&2
