@@ -170,3 +170,4 @@ wandb/*
 *.safetensors
 .claude
 .vscode/settings.json
+hf-ckpts

@@ -331,7 +331,74 @@ dropout. 0.4 in the four controlled arms (Nithya); `small_music_baseline.json` h
 context, so it is not a matched recipe at the moment. This is the second axis of
 a sat-zenon-style multi-CFG (context x control) once the inference side exists.
 
-Not done yet: the inference side. `sample_diffusion` / the DiT's `cfg_scale` still only form the
-prompt null; a control-CFG (`v = v(no ctrl) + s * (v(ctrl) - v(no ctrl))`, with the control set to
-its `null_value` under the same tf mask in the null branch) needs its own scale and a third forward, as sat-zenon's
-`make_multicfg_denoiser` does. Tests: `tests/test_control_conditioning.py` (dropout section).
+The inference side is below (2026-10-04). Tests: `tests/test_control_conditioning.py` (dropout section).
+
+## Inference: three-axis CFG and the Gradio interface (2026-10-04)
+
+Nithya asked for a Gradio interface that switches between the arms (rms, tria_fixed, tria_ema,
+audio), uses each arm's latest model, and exposes all three CFG scales. Decisions (Nithya,
+2026-10-04, from the options offered): **nested composition with a selectable order**, default
+prompt -> context -> control; **WJD validation picker plus upload**; **EMA weights, newest
+`last.ckpt` auto-discovered** with a reload button; **four arms, lazily loaded and kept resident**
+(no base arm).
+
+**Guidance.** `stable_audio_3/inference/multi_cfg.py`. For an order `(a, b, c)` of the three
+conditions and scales `s_a, s_b, s_c`:
+
+    v = v(none) + s_a (v(a) - v(none)) + s_b (v(a,b) - v(a)) + s_c (v(a,b,c) - v(a,b))
+      = (1 - s_a) v(none) + (s_a - s_b) v(a) + (s_b - s_c) v(a,b) + s_c v(a,b,c)
+
+the InstructPix2Pix form sat-zenon's `make_multicfg_denoiser` used for two axes. The nulls are
+the training ones: prompt = zeroed cross-attention/prepend tokens (the DiT's own), context =
+zero latent under the kept `inpaint_mask`, control = `null_value` under the kept `tf_inpaint_mask`
+(0 on hidden frames). Branches with a zero coefficient are not computed, so all scales 1 is one
+forward, and the order **context -> control -> prompt with context = control = 1 is exactly the
+standard prompt CFG** the wandb demos and `listen_wjd_arms.py` run (two forwards: with/without
+prompt, context and control present in both). The branches run as one batch through the DiT with
+its own `cfg_scale` pinned to 1; the callable is passed to `sample_diffusion` as `model` with
+`cond_inputs={}`, so the default sampling path is untouched. Vanilla CFG per axis: no APG / rescale
+on the composed estimate. An arm without a control (base) collapses the control axis.
+`tests/test_multi_cfg.py` (26 tests: nulls, coefficients for every order, batching, dtype).
+
+**Interface.** `run_gradio_wjd.py` -> `stable_audio_3/interface/wjd_control.py`. Arm discovery
+and loading moved from `listen_wjd_arms.py` into `stable_audio_3/inference/wjd_arms.py` (the
+script imports it). Arms resolve from `sbatch/03_3_finetune_wjd_<arm>.sbatch` + the newest
+`last.ckpt` of the group, load on first Generate (DiT bf16, autoencoder fp32) and stay on the
+GPU. The loader prefers EMA weights, but **no WJD checkpoint has any**: `03_3_finetune_wjd_train.sh`
+never passes `--use_ema` to `train_finetune.py` (default off; the `use_ema: true` in the model
+configs' training section is not read by that script), so every `last.ckpt` holds raw weights
+only, the wandb demos were made from raw weights too, and the UI's status line says
+"raw (the checkpoint holds no EMA)". Resuming the arms with `--use_ema` would start an EMA
+from the current weights, not recover one; the autoencoder and T5Gemma are shared between arms (both frozen in every
+finetune). "Load / reload latest checkpoint" re-resolves, and the status line says when a newer
+checkpoint exists. Inputs: a held-out WJD track (drums + target stem + prompt from `meta/`, the
+RMS / TRIA controls sliced from the per-song `drums_features.npz` exactly as training sliced
+them) or uploaded drums + optional stem (controls computed from the clip; the TRIA ema then
+warm-starts at the clip start, which training never did -- noted in the UI). Window (default 12 s
+= 130 frames), start offset (frame-aligned), cursor (context length), control lookahead (training
+saw -4..0 s; outside that the UI says it is extrapolating), the three scales, the order, steps /
+sampler / seed. Outputs: the stem, the stem mixed with the drums (gain 0.7 as the eval script),
+a plot of the three feature controls with the context region, cursor and horizon, the references
+(drums, context as given, target), and a notes box listing the branches and coefficients. Wavs
+are written under `/data/scratch-fast/snnithya/sao-3/gradio-wjd/` with the settings in the name.
+
+    PYTHONPATH=$PWD .venv/bin/python run_gradio_wjd.py            # then ssh -L 7860:<node>:7860
+    PYTHONPATH=$PWD .venv/bin/python run_gradio_wjd.py --arms rms tria_ema --preload --share
+
+Smoke run 2026-10-04 (huang-l40s-2, one L40S), `CannonballAdderley_ThisHere_Orig` piano from 60 s,
+12 s window, cursor 6 s, lookahead 0, 8 pingpong steps, seed 0; the picker's npz controls matched
+the from-audio ones bit for bit for `drums_rms` and `drums_tria_fixed` (TRIA ema differs by
+design: running statistics from the song start vs the clip start, max |diff| 0.41).
+
+| arm | last.ckpt step | load | GPU after load | 1 / 2 branches per step |
+|---|---|---|---|---|
+| rms | 6794 | 12 s | 1.3 GiB | 1.1 s (first call) / 0.5 s |
+| audio | 13702 | 9 s | 2.8 GiB (two arms resident) | 0.5 s / 0.5 s |
+| tria_fixed | 9446 | ~10 s | 4.2 GiB peak (three resident) | 0.5 s / 0.5 s |
+| tria_ema | 3831 | 10 s | 4.7 GiB (all four resident), 5.1 GiB peak | 0.5 s / 0.5 s |
+
+Settings exercised per arm: all scales 1 (one forward); context -> control -> prompt with prompt 4
+(two forwards, the standard CFG); prompt -> context -> control with control 3 (two forwards). Also
+the no-stem path (cursor 0, lookahead +6 s). Generated regions sat at -37 to -44 dBFS. The Gradio
+app built (52 components, 7 endpoints) and served; listening still to do. `tests/test_multi_cfg.py`
+and `tests/test_control_conditioning.py` pass on the node (39 tests). Two fixes from first use (Nithya, 16:00): generated wavs live outside Gradio's cwd/temp dirs, so the launcher passes `--out_dir` as `allowed_paths`; and a click while the job was rewriting `last.ckpt` (3.4 GB, ~10 s, in place) hit a truncated zip, so discovery now returns the newest checkpoint of the run whose zip central directory opens (`is_complete_ckpt`: `last-v1.ckpt` or the newest step file meanwhile) and the loader retries a few times if the file is rewritten under it (`tests/test_wjd_arms.py`).

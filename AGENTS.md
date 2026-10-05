@@ -97,6 +97,8 @@ uv sync --extra flash
 | **Sampling / schedulers** | `stable_audio_3/inference/sampling.py` (`sample_diffusion`, sampler types) |
 | **High-level infer API** | `stable_audio_3/model.py` (`StableAudioModel.generate`, …) |
 | **Gradio controls** | `stable_audio_3/interface/diffusion_cond.py`, launch via `run_gradio.py` |
+| **Three-axis CFG (prompt x context x control)** | `stable_audio_3/inference/multi_cfg.py` (`make_multi_cfg_denoiser`, nested IP2P-style composition; pass it as `model` to `sample_diffusion`), `tests/test_multi_cfg.py` |
+| **WJD arms in Gradio (rms / tria / audio, 3 CFG scales, newest ckpt)** | `run_gradio_wjd.py`, `stable_audio_3/interface/wjd_control.py`; arm discovery + loading in `stable_audio_3/inference/wjd_arms.py` (shared with `scripts/wjd/listen_wjd_arms.py`) |
 | **Conditioning** | `stable_audio_3/models/conditioners.py` |
 | **Inpainting / masks** | `stable_audio_3/models/inpainting.py`, training `inpainting_config` in finetune script |
 | **Upstream docs** | `docs/workflows/inference.md`, `docs/guides/model-overview.md` |

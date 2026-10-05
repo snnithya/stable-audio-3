@@ -18,8 +18,9 @@ beyond, with tf_inpaint_mask telling the model where that cut is.
 Arms default to the four controlled sbatch arms (audio, rms, tria_fixed, tria_ema). Each
 arm's model config and checkpoint group are read from sbatch/03_3_finetune_wjd_<arm>.sbatch
 and its checkpoint is found the way the sbatch continues a run: the most recent last.ckpt
-under <save_base>/<group>/<arm>/sao-3/*/checkpoints/ (EMA weights, what the wandb demos
-use). --arm NAME CONFIG CKPT overrides any of that; CKPT may be a Lightning .ckpt or a
+under <save_base>/<group>/<arm>/sao-3/*/checkpoints/ (EMA weights when the checkpoint has
+them; the WJD jobs run train_finetune.py without --use_ema, so theirs hold raw weights only
+and those are used). --arm NAME CONFIG CKPT overrides any of that; CKPT may be a Lightning .ckpt or a
 .safetensors export.
 
 Usage (from the checkout, so PYTHONPATH picks up this tree):
@@ -40,7 +41,6 @@ import io
 import json
 import math
 import random
-import re
 import sys
 import time
 from datetime import datetime
@@ -59,10 +59,12 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "scripts"))
 from make_listening_page import AUDIO_MIME, data_uri, encode_audio, mel_db  # noqa: E402
 
-DEFAULT_ARMS = ["audio", "rms", "tria_fixed", "tria_ema"]
-DEFAULT_SAVE_BASE = "/data/scratch-fast/snnithya/sao-3/ft_checkpoints"
+from stable_audio_3.inference.multi_cfg import control_ids  # noqa: E402
+from stable_audio_3.inference.wjd_arms import (  # noqa: E402
+    DEFAULT_ARMS, DEFAULT_SAVE_BASE, discover_checkpoint, load_arm, read_sbatch_arm,
+)
+
 DEFAULT_DATASET = "stable_audio_3/configs/dataset_configs/preencoded/wjd_stems_validation_chunked_preencoded.json"
-WANDB_PROJECT = "sao-3"
 MIX_GAIN = 0.7  # as scripts/eval_streamgen.py mixes drums under a continuation
 
 # Feature controls to plot, in sidecar order. The 256-ch drum latent is listened to, not
@@ -71,51 +73,8 @@ FEATURE_CONTROLS = [("drums_rms", "drum RMS"), ("drums_tria_fixed", "TRIA fixed"
 
 
 # ---------------------------------------------------------------------------
-# Arm discovery
+# Arm discovery (shared code: stable_audio_3/inference/wjd_arms.py)
 # ---------------------------------------------------------------------------
-
-
-def read_sbatch_arm(name):
-    """MODEL_CONFIG and GROUP of sbatch/03_3_finetune_wjd_<name>.sbatch, so the arm table
-    lives in one place (the sbatch files) rather than being copied here."""
-    path = REPO / "sbatch" / f"03_3_finetune_wjd_{name}.sbatch"
-    if not path.exists():
-        raise FileNotFoundError(f"No sbatch file for arm {name!r}: {path}")
-    text = path.read_text()
-    fields = {}
-    for key in ("MODEL_CONFIG", "GROUP"):
-        m = re.search(rf"^{key}=(\S+)", text, re.MULTILINE)
-        if not m:
-            raise ValueError(f"{path} does not set {key}")
-        fields[key] = m.group(1)
-    return fields["MODEL_CONFIG"], fields["GROUP"]
-
-
-def complete_safetensors(export_dir):
-    """Newest export that is not still being written: a half-written file shows up with a
-    fraction of its siblings' size (job 2539812 left a 714 MB one next to 1.4 GB ones)."""
-    files = sorted(Path(export_dir).glob("model_step_*.safetensors"), key=lambda p: p.stat().st_mtime)
-    if not files:
-        return None
-    full = max(p.stat().st_size for p in files)
-    for p in reversed(files):
-        if p.stat().st_size >= 0.98 * full:
-            return p
-    return None
-
-
-def discover_checkpoint(name, group, save_base, prefer):
-    """Latest checkpoint of an arm, following sbatch/03_3_finetune_wjd_common.sh's rule for
-    which run a resubmit continues (the newest last.ckpt by mtime)."""
-    arm_dir = Path(save_base) / group / name
-    last = sorted(arm_dir.glob(f"{WANDB_PROJECT}/*/checkpoints/last.ckpt"), key=lambda p: p.stat().st_mtime)
-    export = complete_safetensors(arm_dir / "safetensors_exports")
-    candidates = {"ckpt": last[-1] if last else None, "safetensors": export}
-    order = [prefer] + [k for k in ("ckpt", "safetensors") if k != prefer]
-    for kind in order:
-        if candidates[kind] is not None:
-            return str(candidates[kind])
-    raise FileNotFoundError(f"No checkpoint for arm {name!r} under {arm_dir}")
 
 
 def resolve_arms(args):
@@ -128,72 +87,6 @@ def resolve_arms(args):
         ckpt = discover_checkpoint(name, group, args.save_base, args.prefer)
         arms.append((name, model_config, ckpt))
     return arms
-
-
-# ---------------------------------------------------------------------------
-# Model loading
-# ---------------------------------------------------------------------------
-
-
-def load_arm(model_config_path, ckpt_path, device, use_ema):
-    """Pretrained small-music, then the arm's finetuned weights on top.
-
-    Starting from the pretrained weights (as scripts/train_finetune.py does) means the
-    pretransform and the frozen conditioner are right even if the checkpoint were to lack
-    them. A Lightning .ckpt carries the training wrapper's keys ('diffusion.' prefix) and,
-    with use_ema, the EMA shadow of diffusion.model replaces the raw weights -- that is
-    what the wandb demos are generated with. Returns (model, model_config, step).
-    """
-    from safetensors.torch import load_file
-
-    from stable_audio_3.factory import create_diffusion_cond_from_config
-    from stable_audio_3.loading_utils import copy_state_dict
-    from stable_audio_3.model_configs import models
-
-    with open(model_config_path) as f:
-        model_config = json.load(f)
-    model = create_diffusion_cond_from_config(model_config)
-
-    _, pretrained_ckpt = models["small-music"].resolve()
-    copy_state_dict(model, load_file(pretrained_ckpt))
-
-    step = None
-    if str(ckpt_path).endswith(".safetensors"):
-        state_dict = load_file(ckpt_path)
-        m = re.search(r"model_step_(\d+)", Path(ckpt_path).name)
-        step = int(m.group(1)) if m else None
-        if use_ema:
-            print("  note: a .safetensors export holds the raw (non-EMA) weights")
-    else:
-        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-        step = ckpt.get("global_step")
-        raw = ckpt.get("state_dict", ckpt)
-        ema_prefix = "diffusion_ema.ema_model."
-        has_ema = any(k.startswith(ema_prefix) for k in raw)
-        if use_ema and not has_ema:
-            print(f"  note: {ckpt_path} holds no EMA weights; using the raw ones")
-            use_ema = False
-        state_dict = {}
-        for k, v in raw.items():
-            if k.startswith(ema_prefix):
-                if use_ema:
-                    state_dict["model." + k[len(ema_prefix):]] = v
-            elif k.startswith("diffusion_ema."):
-                continue
-            elif k.startswith("diffusion."):
-                key = k[len("diffusion."):]
-                if use_ema and key.startswith("model."):
-                    continue
-                state_dict[key] = v
-        del ckpt, raw
-    copy_state_dict(model, state_dict)
-    del state_dict
-
-    model.to(device=device, dtype=torch.bfloat16).eval().requires_grad_(False)
-    # fp32 autoencoder for decoding, as train_finetune.load_model: bf16 costs ~11 dB above 10 kHz.
-    if model.pretransform is not None:
-        model.pretransform.to(torch.float32)
-    return model, model_config, step
 
 
 # ---------------------------------------------------------------------------
@@ -274,12 +167,6 @@ def build_masks(padding, cursor_frames, tf_frames):
         cursors.append(cursor)
         horizons.append(horizon)
     return inpaint, tf, cursors, horizons
-
-
-def control_ids(model):
-    """Modular local conds that come from the sidecar (DiffusionCondTrainingWrapper.control_cond_ids)."""
-    internal = ("tf_inpaint_mask", "inpaint_mask", "inpaint_masked_input")
-    return [c for c in model.modular_local_cond_ids if c not in internal]
 
 
 def build_conditioning(model, metadata, latents, controls, inpaint_mask, tf_mask, device):
