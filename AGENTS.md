@@ -4,6 +4,12 @@ This repo extends [Stable Audio 3](https://github.com/Stability-AI/stable-audio-
 
 **Default stance for agents:** optimize for **fast research iteration** — small, reviewable diffs; wire experiments behind flags or config; prefer extending existing hooks over new abstractions. Do not refactor upstream-style code unless the task requires it. Ask questions before making big assumptions. 
 
+> **⚠️ NEVER FINETUNE THE POST-TRAINED (ARC) CHECKPOINTS. FINETUNING ON ARC MODELS MAKES NO SENSE.**
+> **ALWAYS START TRAINING (FULL FINETUNE AND LORA) FROM THE `-base` CHECKPOINTS: `small-music-base`, `small-sfx-base`, `medium-base`.**
+> **`small-music`, `small-sfx` AND `medium` (NO SUFFIX) ARE THE ARC POST-TRAINED MODELS. THEY ARE FOR INFERENCE ONLY.**
+> **IF A SCRIPT, SBATCH OR CONFIG PASSES `--model small-music` TO A TRAINING ENTRYPOINT, THAT IS A BUG. FLAG IT.**
+> (The WJD runs in exp 03 and the exp 1.2 runs were trained from `small-music` by mistake; found 2026-10-05.)
+
 ---
 
 ## Branch & worktree policy (agents)
@@ -62,7 +68,7 @@ uv sync --extra flash
 
 - **Python entrypoints:** `uv run python …` or `uv run stable-audio …`
 - **GPU:** Always run on GPU.
-- **Default research model:** `small-music` unless the user specifies otherwise (post-trained `medium` uses different default `cfg_scale` / `steps`).
+- **Default research model:** `small-music-base` for **ALL TRAINING** (NEVER `small-music`, WHICH IS THE ARC POST-TRAINED MODEL — see the warning at the top). `small-music` only for off-the-shelf inference baselines. Post-trained `medium` uses different default `cfg_scale` / `steps`.
 
 <!-- TODO: fill in your machine(s), CUDA version, typical data roots -->
 - **Data roots:**: /data/hai-res/shared/snnithya/sat-zenon-data/babyslakh-preencoded/

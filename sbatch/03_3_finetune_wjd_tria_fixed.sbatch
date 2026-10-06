@@ -23,5 +23,5 @@
 
 ARM=tria_fixed
 MODEL_CONFIG=stable_audio_3/configs/model_configs/small_music_wjd_drums_tria_fixed.json
-GROUP=03-4-wjd-tria
+GROUP=03-4-wjd-tria-smbase
 source /data/hai-res/snnithya/sa3-tap/stable-audio-3/sbatch/03_3_finetune_wjd_common.sh

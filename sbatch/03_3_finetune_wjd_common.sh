@@ -10,7 +10,9 @@
 # sbatch/03_3_finetune_wjd_train.sh, which is sourced from the pinned clone, so edits to
 # the flags take effect only once committed, like the rest of the code.
 #
-# Mirrors 01_2_finetune.sbatch: same pretrained small-music, same causal inpainting task,
+# Starts from small-music-base, NOT the ARC post-trained small-music (runs before
+# 2026-10-05 used small-music by mistake; their groups lack the -smbase suffix).
+# Otherwise mirrors 01_2_finetune.sbatch: same causal inpainting task,
 # same optimizer, same seed. Items are 12 s chunks (130 frames) from the chunked encode
 # (DATASET_CONFIG overrides; .../wjd_stems_train_preencoded.json is the earlier whole-track
 # one, cropped to 144 frames at a random offset). Each item's prompt is its stem's
@@ -73,7 +75,7 @@ if [ -z "${WANDB_RUN_ID:-}" ] && [ "${FRESH:-0}" != 1 ]; then
         echo "no WANDB_RUN_ID given: continuing the arm's latest run ${WANDB_RUN_ID} (FRESH=1 to start over)"
     fi
 fi
-export WANDB_RUN_ID=${WANDB_RUN_ID:-wjd-${ARM}-${SLURM_JOB_ID:-local}}
+export WANDB_RUN_ID=${WANDB_RUN_ID:-wjd-${ARM}-smbase-${SLURM_JOB_ID:-local}}
 export WANDB_RESUME=allow
 RUN_DIR=${ARM_DIR}/${WANDB_RUN_ID}
 mkdir -p "$RUN_DIR"

@@ -37,7 +37,7 @@ echo "gpus=${NGPU} micro_batch=${MICRO_BATCH} accum=${ACCUM} -> effective batch 
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 
 "$PYTHON" scripts/train_finetune.py \
-    --model small-music \
+    --model small-music-base \
     --model_config "${MODEL_CONFIG}" \
     --dataset_config "${DATASET_CONFIG}" \
     --steps 100000 \
@@ -56,7 +56,7 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
     --resume_every 1000 \
     "${RESUME[@]}" \
     --group "${GROUP}" \
-    --name "wjd-${ARM}" \
+    --name "wjd-${ARM}-smbase" \
     --save_dir "${SAVE_ROOT}/${ARM}"
 
 echo "finished=$(date -Is)"

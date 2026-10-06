@@ -23,5 +23,5 @@
 
 ARM=audio
 MODEL_CONFIG=stable_audio_3/configs/model_configs/small_music_streamgen.json
-GROUP=03-3-wjd-drums-audio
+GROUP=03-3-wjd-drums-audio-smbase
 source /data/hai-res/snnithya/sa3-tap/stable-audio-3/sbatch/03_3_finetune_wjd_common.sh
