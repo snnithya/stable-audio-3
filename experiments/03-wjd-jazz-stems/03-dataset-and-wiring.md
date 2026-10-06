@@ -402,3 +402,29 @@ Settings exercised per arm: all scales 1 (one forward); context -> control -> pr
 the no-stem path (cursor 0, lookahead +6 s). Generated regions sat at -37 to -44 dBFS. The Gradio
 app built (52 components, 7 endpoints) and served; listening still to do. `tests/test_multi_cfg.py`
 and `tests/test_control_conditioning.py` pass on the node (39 tests). Two fixes from first use (Nithya, 16:00): generated wavs live outside Gradio's cwd/temp dirs, so the launcher passes `--out_dir` as `allowed_paths`; and a click while the job was rewriting `last.ckpt` (3.4 GB, ~10 s, in place) hit a truncated zip, so discovery now returns the newest checkpoint of the run whose zip central directory opens (`is_complete_ckpt`: `last-v1.ckpt` or the newest step file meanwhile) and the loader retries a few times if the file is rewritten under it (`tests/test_wjd_arms.py`).
+
+**SDEdit (2026-10-05).** Nithya asked for an SDEdit checkbox: noise the streamgen input by a slider
+amount and denoise from there. The "SDEdit" accordion in the UI (off by default) starts sampling
+from the **drum latent** noised to level sigma, `x = (1 - sigma) z_drums + sigma noise`, and runs
+the chosen steps over [sigma, 0] under the same conditioning and CFG. It goes through
+`sample_diffusion`'s existing `init_data` / `init_noise_level` (`generate_continuation(...,
+sdedit_noise_level=...)`), so the default path is unchanged. Slider 0.01..1, default 0.7; `_sde<sigma>` is
+appended to the wav name. `tests/test_wjd_sdedit.py` (3 tests). Smoke run on an L40S (rms arm,
+old ARC-trained `wjd-rms-2543312` step 15772, which is still on disk because the `-smbase` groups have no
+checkpoint yet; CannonballAdderley_ThisHere_Orig piano at 60 s, cursor 6 s, 8 pingpong steps, all
+scales 1). Envelope correlation of the generated region with the drums:
+sigma 1.0 / 0.9 / 0.7 / 0.5 / 0.3 / 0.1 -> -0.26 / -0.34 / -0.23 / -0.21 / +0.71 / +0.90 (no
+SDEdit: -0.35). So the drums only start to show through below about 0.5. With euler, sigma = 1 matches no-SDEdit
+to GPU noise. Separately, **pingpong is not reproducible from the seed**: its per-step
+re-noising uses the global RNG (`torch.randn_like`), and only the initial noise comes from the
+seeded generator, so two runs with the same seed differ.
+
+**SDEdit from the stem (2026-10-06).** Nithya also wanted SDEdit from the stem being continued. A
+"SDEdit from" radio (`drums` / `stem`, `generate_continuation(..., sdedit_source=...)`) now picks
+which latent gets noised. `stem` uses the whole window, so the target after the cursor leaks into the
+starting point; that is the point of the edit. Wav names now carry `_sde-<source><sigma>`;
+`tests/test_wjd_sdedit.py` has 4 tests. Same smoke setup as above with euler. Envelope correlation of the generated
+region with the target stem: sigma 0.9 / 0.7 / 0.5 / 0.3 / 0.1 -> +0.37 / +0.25 / +0.51 / +0.97 /
++0.99 (no SDEdit: +0.27). As with drums, the source dominates below about 0.3 to 0.5. On a fresh node
+the T5Gemma download fails with a 401 unless `HF_HOME=/data/hai-res/snnithya/.cache/huggingface`
+(the sbatch value) is set.

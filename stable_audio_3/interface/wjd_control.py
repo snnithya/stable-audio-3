@@ -20,6 +20,11 @@ Two input sources:
   are computed from the clip (``stable_audio_3/data/features.py``); the TRIA ema statistics
   warm-start from the dataset constants at the clip start rather than from a song's history.
 
+**SDEdit** (optional): instead of starting from pure noise, the sampler starts from the latent
+of the streamgen input (the drum audio) or of the stem to continue, noised to a chosen level
+``sigma`` -- ``x = (1 - sigma) * z + sigma * noise`` -- and denoises from ``sigma`` to 0 under the
+same conditioning (``sample_diffusion``'s ``init_data`` / ``init_noise_level``).
+
 Launch with ``run_gradio_wjd.py``.
 """
 
@@ -78,6 +83,7 @@ FEATURE_CONTROLS = [("drums_rms", "drum RMS"), ("drums_tria_fixed", "TRIA fixed"
 SOURCE_PICKER = "WJD validation track"
 SOURCE_UPLOAD = "Upload audio"
 SAMPLERS = ["pingpong", "euler", "rk4", "dpmpp"]
+SDEDIT_SOURCES = ["drums", "stem"]  # what SDEdit noises: the streamgen input or the stem to continue
 
 
 # ---------------------------------------------------------------------------
@@ -350,10 +356,15 @@ def generate_continuation(
     steps: int,
     sampler_type: str,
     seed: int,
+    sdedit_noise_level: tp.Optional[float] = None,
+    sdedit_source: str = "drums",
 ):
     """One continuation. ``drums`` / ``stem`` are ``[2, N]`` at the model rate with ``N`` a
     multiple of the latent hop; ``controls`` holds the feature controls ``[C, T]`` the arm may
-    use. Returns ``(audio [2, N], info dict)``."""
+    use. ``sdedit_noise_level`` (in (0, 1]) starts sampling from the latent of ``sdedit_source``
+    (``"drums"`` or ``"stem"``, the whole window) noised to that level instead of from pure noise
+    (SDEdit); ``None`` = pure noise.
+    Returns ``(audio [2, N], info dict)``."""
     model = arm.model
     device = next(model.model.parameters()).device
     sr = arm.model_config["sample_rate"]
@@ -371,6 +382,20 @@ def generate_continuation(
     inpaint_mask, tf_mask, cursor, horizon = build_masks(n_frames, cursor_frames, lookahead_frames)
     inpaint_mask, tf_mask = inpaint_mask.to(device), tf_mask.to(device)
 
+    sdedit_drums = sdedit_noise_level is not None and sdedit_source == "drums"
+    if sdedit_noise_level is not None:
+        if sdedit_source not in SDEDIT_SOURCES:
+            raise ValueError(f"SDEdit source must be one of {SDEDIT_SOURCES}, got {sdedit_source!r}")
+        if sdedit_source == "drums" and drums is None:
+            raise ValueError("SDEdit from drums needs drum audio (the streamgen input is what gets noised)")
+        if sdedit_source == "stem" and stem is None:
+            raise ValueError("SDEdit from the stem needs a stem to continue")
+        if not 0.0 < sdedit_noise_level <= 1.0:
+            raise ValueError(f"SDEdit noise level must be in (0, 1], got {sdedit_noise_level}")
+    drums_latent = None
+    if drums is not None and (sdedit_drums or "streamgen_latent" in arm.controls):
+        drums_latent = encode(model, drums, device)[..., :n_frames]
+
     if stem is not None:
         stem_latent = encode(model, stem, device)[..., :n_frames]
     else:
@@ -385,7 +410,7 @@ def generate_continuation(
         if cid == "streamgen_latent":
             if drums is None:
                 raise ValueError("the audio arm needs drum audio (its control is the drum latent)")
-            ctrl = encode(model, drums, device)
+            ctrl = drums_latent
         elif cid in controls:
             ctrl = controls[cid][None].to(device)
         else:
@@ -400,6 +425,10 @@ def generate_continuation(
 
     gen = torch.Generator().manual_seed(int(seed))
     noise = torch.randn(1, model.io_channels, n_frames, generator=gen).to(device, torch.bfloat16)
+    init_kwargs = {}
+    if sdedit_noise_level is not None:
+        init = drums_latent if sdedit_source == "drums" else stem_latent
+        init_kwargs = {"init_data": init.to(noise.dtype), "init_noise_level": float(sdedit_noise_level)}
     conditioning = [{"prompt": prompt, "seconds_total": seconds_total}]
     t0 = time.time()
     with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
@@ -421,6 +450,7 @@ def generate_continuation(
             batch_cfg=True,
             disable_tqdm=True,
             decode=False,
+            **init_kwargs,
         )
     audio = decode(model, latents)[0, :, :n_samples].clamp(-1, 1)
     info = {
@@ -428,6 +458,8 @@ def generate_continuation(
         "cursor_frames": cursor, "horizon_frames": horizon,
         "cursor_seconds": cursor / fps, "horizon_seconds": horizon / fps,
         "branches": branches, "sampling_seconds": time.time() - t0,
+        "sdedit_noise_level": sdedit_noise_level,
+        "sdedit_source": sdedit_source if sdedit_noise_level is not None else None,
     }
     return audio, info
 
@@ -544,7 +576,7 @@ def create_wjd_control_ui(registry: ArmRegistry, catalog: tp.Dict[str, Track], o
 
     def generate(arm_name, source, track, stem_name, offset_s, window_s, up_drums, up_stem, prompt,
                  cursor_s, lookahead_s, s_prompt, s_context, s_control, order_label,
-                 steps, sampler_type, seed, progress=gr.Progress()):
+                 steps, sampler_type, seed, sdedit_on, sdedit_source, sdedit_level, progress=gr.Progress()):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         gc.collect()
@@ -591,10 +623,11 @@ def create_wjd_control_ui(registry: ArmRegistry, catalog: tp.Dict[str, Track], o
             seed = int(np.random.randint(0, 2**31 - 1))
 
         progress(0.25, desc=f"sampling ({steps} steps)")
+        sdedit_noise_level = float(sdedit_level) if sdedit_on else None
         try:
             audio, info = generate_continuation(
                 arm, prompt, drums, stem, controls, cursor_s, lookahead_s, scales, order,
-                steps, sampler_type, seed,
+                steps, sampler_type, seed, sdedit_noise_level=sdedit_noise_level, sdedit_source=sdedit_source,
             )
         except ValueError as e:
             raise gr.Error(str(e)) from e
@@ -603,7 +636,8 @@ def create_wjd_control_ui(registry: ArmRegistry, catalog: tp.Dict[str, Track], o
         ts = time.strftime("%Y%m%d-%H%M%S")
         base = (f"{ts}_{arm_name}_{_slug(label['track'])}_{_slug(label['stem'])}_off{offset_s:g}"
                 f"_cur{info['cursor_seconds']:.1f}_la{lookahead_s:g}"
-                f"_p{s_prompt:g}_c{s_context:g}_k{s_control:g}_{'-'.join(a[0] for a in order)}_s{seed}")
+                f"_p{s_prompt:g}_c{s_context:g}_k{s_control:g}_{'-'.join(a[0] for a in order)}_s{seed}"
+                + (f"_sde-{sdedit_source}{sdedit_noise_level:g}" if sdedit_noise_level is not None else ""))
         paths = {"gen": _save(out_dir / f"{base}.wav", audio, sample_rate)}
         mix = MIX_GAIN * (audio + drums)
         paths["mix"] = _save(out_dir / f"{base}+drums.wav", mix, sample_rate)
@@ -631,6 +665,10 @@ def create_wjd_control_ui(registry: ArmRegistry, catalog: tp.Dict[str, Track], o
             f"{info['sampling_seconds']:.1f} s",
             f"written to {out_dir}/{base}*.wav",
         ]
+        if sdedit_noise_level is not None:
+            what = "drum latent (streamgen input)" if sdedit_source == "drums" else "stem latent (whole window, incl. the target after the cursor)"
+            notes.insert(4, f"SDEdit: started from the {what} noised to sigma = {sdedit_noise_level:g} "
+                            f"({steps} steps over [{sdedit_noise_level:g}, 0])")
         if stem is None:
             notes.insert(2, "no stem: context empty (cursor 0); the control is visible only through the lookahead")
         if not (TRAINED_LOOKAHEAD[0] <= lookahead_s <= TRAINED_LOOKAHEAD[1]):
@@ -692,6 +730,13 @@ def create_wjd_control_ui(registry: ArmRegistry, catalog: tp.Dict[str, Track], o
                         steps_slider = gr.Slider(1, 200, value=8, step=1, label="Steps")
                         sampler_dropdown = gr.Dropdown(SAMPLERS, value=SAMPLERS[0], label="Sampler")
                         seed_number = gr.Number(value=-1, precision=0, label="Seed (-1 = random)")
+                with gr.Accordion("SDEdit", open=False):
+                    sdedit_checkbox = gr.Checkbox(value=False, label="SDEdit",
+                                                  info="start from the latent below noised to the chosen level, not from pure noise")
+                    sdedit_source_radio = gr.Radio(SDEDIT_SOURCES, value=SDEDIT_SOURCES[0], label="SDEdit from",
+                                                   info="drums = the streamgen input; stem = the stem to continue (whole window)")
+                    sdedit_slider = gr.Slider(0.01, 1.0, value=0.7, step=0.01, label="SDEdit noise level (sigma)",
+                                              info="x = (1 - sigma) z + sigma noise; 1 = pure noise, lower keeps more of the source")
             with gr.Column():
                 gen_audio = gr.Audio(label="Generated stem", type="filepath", interactive=False)
                 mix_audio = gr.Audio(label="Generated stem + drums", type="filepath", interactive=False)
@@ -712,7 +757,8 @@ def create_wjd_control_ui(registry: ArmRegistry, catalog: tp.Dict[str, Track], o
             generate,
             inputs=[arm_dropdown, source_radio, track_dropdown, stem_dropdown, offset_slider, window_slider,
                     drums_upload, stem_upload, prompt_box, cursor_slider, lookahead_slider,
-                    s_prompt, s_context, s_control, order_dropdown, steps_slider, sampler_dropdown, seed_number],
+                    s_prompt, s_context, s_control, order_dropdown, steps_slider, sampler_dropdown, seed_number,
+                    sdedit_checkbox, sdedit_source_radio, sdedit_slider],
             outputs=[gen_audio, mix_audio, controls_image, notes_box, drums_audio, context_audio, target_audio, status_md],
             api_name="generate",
         )

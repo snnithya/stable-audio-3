@@ -1,9 +1,9 @@
 #!/bin/bash
 #SBATCH --job-name=wjd-ft-tria-ema
-#SBATCH --partition=hai-res-l40s
-#SBATCH --qos=hai-res-main
+#SBATCH --partition=csail-shared-h200
+#SBATCH --qos=shared-if-available
 #SBATCH --account=hai-res
-#SBATCH --gres=gpu:l40s:2
+#SBATCH --gres=gpu:4
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=128G
 #SBATCH --time=24:00:00
